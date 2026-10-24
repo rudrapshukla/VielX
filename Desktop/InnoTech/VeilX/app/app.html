@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<!--
+  app/app.html — VeilX Studio (Standalone Extension Web App, inspired by Inssist).
+  Runs in its own `chrome-extension://<id>/app/app.html` tab, embedding Instagram
+  Direct alongside VeilX's Quantum-Safe Security Command Deck.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>VeilX Studio · Quantum-Safe Instagram Direct</title>
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <div class="studio-layout">
+
+    <!-- Left Navigation & Quantum Security Command Deck -->
+    <aside class="studio-sidebar">
+      <div class="studio-brand">
+        <div class="brand-logo">V</div>
+        <div class="brand-meta">
+          <h1 class="brand-title">VeilX Studio</h1>
+          <span class="brand-sub">FIPS 203 ML-KEM-768 + P-256</span>
+        </div>
+      </div>
+
+      <!-- Status Pill -->
+      <div class="studio-status-bar">
+        <span class="status-dot" id="studioStatusDot"></span>
+        <span id="studioStatusText">Encryption Active</span>
+        <label class="switch" title="Master Encryption Switch">
+          <input type="checkbox" id="studioMasterToggle" checked />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <!-- Active Thread Selector / Manager -->
+      <section class="studio-card">
+        <div class="card-header">
+          <h2 class="card-title">Active Conversation</h2>
+          <span class="badge" id="activeThreadBadge">None selected</span>
+        </div>
+        <p class="card-desc" id="activeThreadDesc">
+          Select a conversation in the Instagram Direct pane on the right (or paste a thread URL/ID below) to manage its Post-Quantum key.
+        </p>
+        <div class="input-group">
+          <input type="text" id="threadInput" class="studio-input mono" placeholder="Thread ID or /direct/t/… URL" />
+          <button type="button" class="studio-btn" id="loadThreadBtn">Load</button>
+        </div>
+
+        <div id="threadKeyActions" hidden>
+          <div class="safety-box" id="studioSafetyBox" hidden>
+            <span class="safety-label">80-bit Safety Code</span>
+            <code class="safety-code" id="studioSafetyCode"></code>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="studio-btn primary" id="studioVerifyBtn" hidden>Verify Code</button>
+            <button type="button" class="studio-btn danger" id="studioRemoveKeyBtn">Remove Key</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Set Up Key for Loaded Thread -->
+      <section class="studio-card" id="studioSetupCard">
+        <h2 class="card-title">Set Up Conversation Key</h2>
+        <p class="card-desc">Choose a shared passphrase (600,000 PBKDF2-SHA256 iterations) or use automatic ML-KEM-768 key exchange inside the chat.</p>
+        <input type="password" id="studioPassInput" class="studio-input mono" placeholder="Shared passphrase (min 12 chars)" />
+        <div class="btn-row">
+          <button type="button" class="studio-btn" id="studioGenPassBtn">Generate</button>
+          <button type="button" class="studio-btn" id="studioCopyPassBtn">Copy</button>
+          <button type="button" class="studio-btn primary" id="studioSavePassBtn">Save Key</button>
+        </div>
+      </section>
+
+      <!-- All Keyed Conversations List -->
+      <section class="studio-card flex-grow">
+        <div class="card-header">
+          <h2 class="card-title">Secured Chats</h2>
+          <span class="badge" id="chatCountBadge">0</span>
+        </div>
+        <div class="thread-list" id="securedThreadsList">
+          <p class="empty-hint">No conversation keys saved yet.</p>
+        </div>
+      </section>
+
+      <!-- Master Vault & Preferences -->
+      <section class="studio-card">
+        <div class="card-header">
+          <h2 class="card-title">Master Key Vault</h2>
+          <span class="badge" id="studioVaultBadge">Unlocked</span>
+        </div>
+        <div class="input-group">
+          <input type="password" id="studioVaultInput" class="studio-input mono" placeholder="Master passphrase (min 12 chars)" />
+          <button type="button" class="studio-btn" id="studioVaultActionBtn">Lock</button>
+        </div>
+        <div class="toggles-list">
+          <label class="check-row">
+            <input type="checkbox" id="studioAutoDecrypt" checked />
+            <span>Auto-decrypt incoming messages</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" id="studioBeautifyUi" checked />
+            <span>Purplish-Bluish Instagram UI Theme</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" id="studioPadMessages" checked />
+            <span>32-byte block padding (hide length)</span>
+          </label>
+        </div>
+        <p class="studio-notice" id="studioNotice" hidden></p>
+      </section>
+    </aside>
+
+    <!-- Right Main Workspace: Embedded Instagram Direct -->
+    <main class="studio-workspace">
+      <header class="workspace-topbar">
+        <div class="topbar-left">
+          <span class="workspace-pill">Isolated Extension Workspace</span>
+          <span class="workspace-url" id="workspaceUrlLabel">https://www.instagram.com/direct/inbox/</span>
+        </div>
+        <div class="topbar-right">
+          <button type="button" class="studio-btn" id="reloadFrameBtn">Reload Inbox</button>
+          <button type="button" class="studio-btn primary" id="openIgTabBtn">Open in Full Tab ↗</button>
+        </div>
+      </header>
+      <div class="iframe-container">
+        <iframe
+          id="igWorkspaceFrame"
+          class="ig-frame"
+          src="https://www.instagram.com/direct/inbox/"
+          allow="clipboard-read; clipboard-write"
+        ></iframe>
+      </div>
+    </main>
+
+  </div>
+
+  <script src="../src/crypto.js"></script>
+  <script src="../src/util.js"></script>
+  <script src="../src/store.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
