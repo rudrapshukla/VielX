@@ -6,8 +6,6 @@
 > *Lead me from falsehood to truth.*
 > — Bṛhadāraṇyaka Upaniṣad, 1.3.28
 
-![VeilX Preview](thumbnail.png)
-
 ## Key Capabilities
 
 * **Cross-Origin Keystroke & Plaintext Isolation:** Replaces Instagram's native Lexical input box with a dedicated `chrome-extension://` iframe pill composer (`composer/composer.html`). Typing events (`keydown`, `beforeinput`, `input`, `paste`) fire strictly inside the extension's isolated browsing context and never enter Instagram's DOM or `window` capture listeners.
@@ -75,7 +73,7 @@ VeilX v5.2.0 partitions execution across five browser contexts to enforce strict
 2. Under the **Shared Passphrase** tab, click **Generate** to create a 100-bit cryptographic passphrase (or enter your own 12+ character passphrase), click **Copy**, and share it with your contact over a trusted channel.
 3. Click **Save Key**. Both you and your contact can immediately send and receive encrypted messages in the chat.
 
-### Using VeilX Studio & Master Key Vault
+### Using VeilX Studio & Master Key Vault(Studio send messege but on the sender size update happen only after when they refresh the page)
 * **VeilX Studio:** Click **Open VeilX Studio ↗** at the top of the VeilX popup to open the standalone split-screen web app (`app/app.html`).
 * **Master Key Vault:** In the popup or Studio sidebar, enter a 12+ character master passphrase under **Master Key Vault** and click **Lock Vault** when stepping away from your device. All stored conversation keys and private keys are encrypted into a single `AES-256-GCM` vault blob and wiped from plaintext storage until unlocked.
 
@@ -147,4 +145,4 @@ The 46-test suite verifies:
 
 ## License & Credits
 
-Created by **Team Monolith** ([Rudra Pratap Shukla](https://github.com/rudrapshukla)). Released under the [MIT License](LICENSE).
+Created by Rudra Pratap Shukla(https://github.com/rudrapshukla). Released under the [MIT License](LICENSE).
