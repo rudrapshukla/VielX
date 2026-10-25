@@ -1,0 +1,356 @@
+/*
+  app/app.css — VeilX Studio Standalone Web App Styling.
+  Purplish-Bluish Instagram-inspired Electric Indigo, Cosmic Violet, and Royal Blue
+  palette on a deep midnight slate canvas.
+*/
+
+:root {
+  --bg-canvas:   #080911;
+  --bg-sidebar:  #0d0f1a;
+  --bg-card:     #131626;
+  --bg-input:    #0a0c16;
+  --border:      rgba(139, 92, 246, 0.2);
+  --border-glow: rgba(139, 92, 246, 0.52);
+  --text:        #f5f6fa;
+  --muted:       #9da2c0;
+  --subtle:      #6c7190;
+  --indigo:      #6366f1;
+  --violet:      #8b5cf6;
+  --blue:        #3b82f6;
+  --grad:        linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #3b82f6 100%);
+  --danger:      #f87171;
+  --amber:       #fbbf24;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html, body {
+  width: 100%;
+  height: 100vh;
+  background: var(--bg-canvas);
+  color: var(--text);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+.studio-layout {
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+}
+
+/* ── Left Sidebar Command Deck ────────────────────────────────────────── */
+.studio-sidebar {
+  width: 370px;
+  flex-shrink: 0;
+  height: 100vh;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+}
+
+.studio-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand-logo {
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  background: var(--grad);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 800;
+  color: #ffffff;
+  box-shadow: 0 4px 16px rgba(99, 102, 241, 0.4);
+}
+
+.brand-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+}
+
+.brand-sub {
+  font-size: 11px;
+  color: #a5b4fc;
+  font-weight: 500;
+}
+
+.studio-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 12.5px;
+}
+.studio-status-bar span:nth-child(2) {
+  flex: 1;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--subtle);
+}
+.status-dot.on {
+  background: #8b5cf6;
+  box-shadow: 0 0 10px #8b5cf6;
+}
+
+/* Switch */
+.switch { position: relative; display: inline-block; width: 38px; height: 22px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; inset: 0; width: 100%; height: 100%; cursor: pointer; }
+.switch-track {
+  position: absolute; inset: 0; border-radius: 22px;
+  background: var(--bg-input); border: 1px solid var(--border);
+  transition: 0.15s;
+}
+.switch-thumb {
+  position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--muted); transition: 0.15s;
+}
+.switch input:checked + .switch-track { background: var(--grad); border-color: transparent; }
+.switch input:checked + .switch-track .switch-thumb { transform: translateX(16px); background: #fff; }
+
+.studio-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 13px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.studio-card.flex-grow {
+  flex: 1;
+  min-height: 120px;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.card-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.card-desc {
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(99, 102, 241, 0.16);
+  color: #c7d2fe;
+  border: 1px solid rgba(139, 92, 246, 0.32);
+}
+
+.input-group, .btn-row {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.studio-input {
+  flex: 1;
+  min-width: 140px;
+  padding: 7px 11px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 12px;
+}
+.studio-input:focus {
+  outline: none;
+  border-color: var(--border-glow);
+}
+
+.studio-btn {
+  padding: 7px 13px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: #1b2038;
+  color: var(--text);
+  font: 600 12px inherit;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.studio-btn:hover:not(:disabled) {
+  border-color: var(--border-glow);
+  background: #232946;
+}
+.studio-btn.primary {
+  background: var(--grad);
+  border-color: transparent;
+  color: #ffffff;
+  box-shadow: 0 2px 12px rgba(99, 102, 241, 0.32);
+}
+.studio-btn.danger {
+  color: var(--danger);
+}
+
+.safety-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+}
+.safety-label {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+.safety-code {
+  font: 600 12.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color: #c7d2fe;
+  letter-spacing: 0.8px;
+}
+
+.thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+}
+.thread-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: 0.15s;
+}
+.thread-item:hover {
+  border-color: var(--border-glow);
+}
+.thread-item-id {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: #e0e7ff;
+}
+.thread-item-mode {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.empty-hint {
+  font-size: 11.5px;
+  color: var(--subtle);
+}
+
+.toggles-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 4px;
+}
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.check-row input {
+  accent-color: var(--violet);
+}
+
+.studio-notice {
+  font-size: 11.5px;
+  color: #c7d2fe;
+  padding-top: 4px;
+}
+
+/* ── Right Main Workspace ─────────────────────────────────────────────── */
+.studio-workspace {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bg-canvas);
+}
+
+.workspace-topbar {
+  height: 52px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.topbar-left, .topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.workspace-pill {
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(139, 92, 246, 0.16);
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  color: #ddd6fe;
+  font-size: 11px;
+  font-weight: 600;
+}
+.workspace-url {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.iframe-container {
+  flex: 1;
+  width: 100%;
+  height: calc(100vh - 52px);
+  position: relative;
+}
+.ig-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #000;
+}
