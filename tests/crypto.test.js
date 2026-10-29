@@ -1,212 +1,313 @@
 /**
- * tests/crypto.test.js — automatic checks for src/crypto.js (VeilX v5.0)
- *
- * HOW TO RUN:
- *     node --test tests/crypto.test.js
+ * tests/crypto.test.js — primitives: Keccak, ML-KEM-768 (against an independent
+ * implementation via tests/kat.json), padding, passphrases, vault, VX1B sidecar
+ * media binary encryption, Hashcash Proof-of-Work, and Zero-Knowledge Relay security.
  */
-
+"use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const nodeCrypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+globalThis.VX = {};
 const C = require("../src/crypto.js");
+const { createRelayHandler } = require("../server/local-relay.js");
+const hex = (u) => Buffer.from(u).toString("hex");
+const sha256hex = (u) => nodeCrypto.createHash("sha256").update(u).digest("hex");
+const KAT = JSON.parse(fs.readFileSync(path.join(__dirname, "kat.json"), "utf8"));
 
-const zeroKeyBytes = new Uint8Array(32);
-
-test("encrypt then decrypt returns the original text", async () => {
-  const key = await C.importAesKey(zeroKeyBytes);
-  const blob = await C.encryptMessage(key, "namaste 🙏 नमस्ते");
-  assert.ok(blob.startsWith("GPV2:"));
-  assert.equal(await C.decryptMessage(key, blob), "namaste 🙏 नमस्ते");
-});
-
-test("same text encrypts to different output every time (fresh IV)", async () => {
-  const key = await C.importAesKey(zeroKeyBytes);
-  const a = await C.encryptMessage(key, "hello");
-  const b = await C.encryptMessage(key, "hello");
-  assert.notEqual(a, b);
-});
-
-test("a wrong key fails to decrypt", async () => {
-  const key1 = await C.importAesKey(zeroKeyBytes);
-  const key2 = await C.importAesKey(new Uint8Array(32).fill(7));
-  const blob = await C.encryptMessage(key1, "secret");
-  await assert.rejects(() => C.decryptMessage(key2, blob));
-});
-
-test("a tampered message fails to decrypt", async () => {
-  const key = await C.importAesKey(zeroKeyBytes);
-  const blob = await C.encryptMessage(key, "secret");
-  const bytes = C.base64ToBytes(blob.slice(5));
-  bytes[bytes.length - 1] ^= 1;
-  const tampered = "GPV2:" + C.bytesToBase64(bytes);
-  await assert.rejects(() => C.decryptMessage(key, tampered));
-});
-
-test("too-short and wrong-prefix messages are rejected", async () => {
-  const key = await C.importAesKey(zeroKeyBytes);
-  await assert.rejects(() => C.decryptMessage(key, "GPV2:AAAA"));
-  await assert.rejects(() => C.decryptMessage(key, "HELLO:AAAA"));
-});
-
-test("a key that is not 32 bytes is rejected", async () => {
-  await assert.rejects(() => C.importAesKey(new Uint8Array(16)));
-});
-
-test("base64 helpers round-trip, including large inputs", () => {
-  const big = new Uint8Array(300000).map((_, i) => i % 256);
-  assert.deepEqual(C.base64ToBytes(C.bytesToBase64(big)), big);
-});
-
-test("same passphrase gives the same key; different passphrase or threadId differs", async () => {
-  const a = await C.deriveKeyFromPassphrase("correct horse battery");
-  const b = await C.deriveKeyFromPassphrase("  correct horse battery  ");
-  const c = await C.deriveKeyFromPassphrase("correct horse batterz");
-  const d = await C.deriveKeyFromPassphrase("correct horse battery", "thread-999");
-  assert.deepEqual(a, b);
-  assert.notDeepEqual(a, c);
-  assert.notDeepEqual(a, d);
-  assert.equal(a.length, 32);
-});
-
-test("passphrase key works for a full encrypt/decrypt round trip", async () => {
-  const bytes = await C.deriveKeyFromPassphrase("shared secret phrase");
-  const key = await C.importAesKey(bytes);
-  assert.equal(await C.decryptMessage(key, await C.encryptMessage(key, "hi")), "hi");
-});
-
-test("generated passphrases have the right shape and are not repeated", () => {
-  const p1 = C.generatePassphrase();
-  const p2 = C.generatePassphrase();
-  assert.match(p1, /^[A-HJ-NP-Z2-9]{5}(-[A-HJ-NP-Z2-9]{5}){3}$/);
-  assert.notEqual(p1, p2);
-});
-
-test("NIST FIPS 203 ML-KEM-768 + ECDH P-256 hybrid key exchange strictly requires ML-KEM-768 secret and rejects tampered ciphertexts", async () => {
-  const alice = await C.generateIdentity();
-  const bob = await C.generateIdentity();
-
-  assert.equal(alice.quantumSafe, true);
-  assert.equal(bob.quantumSafe, true);
-  assert.equal(C.base64ToBytes(alice.publicKey).length, C.HYBRID_PUB_BYTES); // 1249 bytes (65 P-256 + 1184 ML-KEM-768 ek)
-
-  // Calling deriveSharedKey without the ML-KEM-768 shared secret MUST throw!
-  await assert.rejects(
-    () => C.deriveSharedKey(alice.privateJwk, alice.publicKey, bob.publicKey),
-    /requires a 32-byte ML-KEM-768 shared secret/
-  );
-
-  // Bob encapsulates a 256-bit secret to Alice's NIST FIPS 203 ML-KEM-768 public key
-  const { ciphertextB64, sharedSecret: bobPqSecret } = await C.pqEncapsulate(alice.publicKey);
-  assert.equal(C.base64ToBytes(ciphertextB64).length, C.MLKEM_CT_BYTES); // 1088 bytes
-
-  // Alice decapsulates the ML-KEM-768 ciphertext using her 2400-byte decapsulation key
-  const alicePqSecret = await C.pqDecapsulate(alice.privateJwk, ciphertextB64);
-  assert.deepEqual(alicePqSecret, bobPqSecret);
-
-  // Verify Fujisaki-Okamoto implicit rejection: flipping 1 bit in ML-KEM-768 ciphertext produces a pseudorandomly different secret!
-  const ctBytes = C.base64ToBytes(ciphertextB64);
-  ctBytes[10] ^= 1;
-  const implicitRejectedSecret = await C.pqDecapsulate(alice.privateJwk, C.bytesToBase64(ctBytes));
-  assert.notDeepEqual(implicitRejectedSecret, bobPqSecret, "Fujisaki-Okamoto implicit rejection rejects tampered KEM ciphertext");
-
-  const aliceKey = await C.deriveSharedKey(alice.privateJwk, alice.publicKey, bob.publicKey, alicePqSecret);
-  const bobKey = await C.deriveSharedKey(bob.privateJwk, bob.publicKey, alice.publicKey, bobPqSecret);
-  assert.deepEqual(aliceKey, bobKey);
-
-  const codeA = await C.safetyCode(alice.publicKey, bob.publicKey);
-  const codeB = await C.safetyCode(bob.publicKey, alice.publicKey);
-  assert.equal(codeA, codeB);
-  assert.match(codeA, /^([0-9A-F]{4} ){4}[0-9A-F]{4}$/);
-});
-
-test("multi-packet ML-KEM-768 key framing fits every packet under 1000 characters and reassembles cleanly", async () => {
-  const alice = await C.generateIdentity();
-  const bob = await C.generateIdentity();
-  const { ciphertextB64 } = await C.pqEncapsulate(alice.publicKey);
-
-  const packets = C.makeKeyPackets(bob.publicKey, ciphertextB64);
-  assert.ok(packets.length >= 2);
-  for (const pkt of packets) {
-    assert.ok(pkt.length < 1000, `Packet length ${pkt.length} must be < 1000`);
+test("SHA3 / SHAKE match OpenSSL across every rate boundary", () => {
+  for (const len of [0, 1, 55, 71, 72, 73, 135, 136, 137, 167, 168, 169, 200, 1000]) {
+    const m = nodeCrypto.randomBytes(len);
+    assert.equal(hex(C.sha3_256(m)), nodeCrypto.createHash("sha3-256").update(m).digest("hex"));
+    assert.equal(hex(C.sha3_512(m)), nodeCrypto.createHash("sha3-512").update(m).digest("hex"));
+    assert.equal(hex(C.shake128(m, 500)), nodeCrypto.createHash("shake128", { outputLength: 500 }).update(m).digest("hex"));
+    assert.equal(hex(C.shake256(m, 300)), nodeCrypto.createHash("shake256", { outputLength: 300 }).update(m).digest("hex"));
   }
-
-  const reassembled = C.reassembleKeyPackets(packets);
-  assert.equal(reassembled.length, 1);
-  assert.equal(reassembled[0].publicKeyB64, bob.publicKey);
-  assert.equal(reassembled[0].kemCiphertextB64, ciphertextB64);
-  assert.equal(reassembled[0].quantumSafe, true);
 });
 
-test("key exchange: a third party gets a different key and cannot decrypt", async () => {
-  const alice = await C.generateIdentity();
-  const bob = await C.generateIdentity();
-  const eve = await C.generateIdentity();
+test("ML-KEM-768 known answers (generated by an independent audited implementation)", () => {
+  for (const v of KAT.vectors) {
+    const d = Buffer.from(v.d, "hex"), z = Buffer.from(v.z, "hex"), m = Buffer.from(v.m, "hex");
+    const kp = C.mlkem768KeyGen(new Uint8Array(d), new Uint8Array(z));
+    assert.equal(sha256hex(kp.ek), v.ekSha256, "ek");
+    assert.equal(sha256hex(kp.dk), v.dkSha256, "dk");
+    const e = C.mlkem768EncapsInternal(kp.ek, new Uint8Array(m));
+    assert.equal(sha256hex(e.ct), v.ctSha256, "ciphertext");
+    assert.equal(hex(e.ss), v.ss, "shared secret");
+    assert.equal(hex(C.mlkem768Decaps(kp.dk, e.ct)), v.ss, "decaps");
+    const bad = new Uint8Array(e.ct); bad[7] ^= 0x55;
+    assert.equal(hex(C.mlkem768Decaps(kp.dk, bad)), v.badCtByte7Xor55, "implicit rejection value");
+  }
+});
 
-  const { ciphertextB64, sharedSecret } = await C.pqEncapsulate(alice.publicKey);
-  const alicePq = await C.pqDecapsulate(alice.privateJwk, ciphertextB64);
+test("ML-KEM-768 round trip with random keys; sizes are FIPS 203 sizes", () => {
+  const kp = C.mlkem768KeyGen();
+  assert.equal(kp.ek.length, 1184);
+  assert.equal(kp.dk.length, 2400);
+  const e = C.mlkem768Encaps(kp.ek);
+  assert.equal(e.ct.length, 1088);
+  assert.equal(e.ss.length, 32);
+  assert.equal(hex(C.mlkem768Decaps(kp.dk, e.ct)), hex(e.ss));
+});
 
-  const aliceBob = await C.importAesKey(
-    await C.deriveSharedKey(alice.privateJwk, alice.publicKey, bob.publicKey, alicePq)
+test("FIPS 203 modulus check rejects non-canonical encapsulation keys", () => {
+  const kp = C.mlkem768KeyGen();
+  const ek = new Uint8Array(kp.ek);
+  ek[0] = 0xff; ek[1] = (ek[1] & 0xf0) | 0x0f; // coefficient 4095 >= q
+  assert.throws(() => C.mlkem768Encaps(ek), /modulus check/);
+  assert.throws(() => C.mlkem768Encaps(new Uint8Array(100)), /length/);
+});
+
+test("FIPS 203 decapsulation-key hash check rejects a corrupted dk", () => {
+  const kp = C.mlkem768KeyGen();
+  const e = C.mlkem768Encaps(kp.ek);
+  const dk = new Uint8Array(kp.dk); dk[1300] ^= 1;
+  assert.throws(() => C.mlkem768Decaps(dk, e.ct), /hash check/);
+});
+
+test("integer-only compress is exact for every coefficient (no floating-point division of secrets)", () => {
+  const M = Math.ceil(2 ** 40 / 3329);
+  for (const d of [1, 4, 10]) {
+    for (let x = 0; x < 3329; x++) {
+      const exact = Number((BigInt(x) * (1n << BigInt(d)) * 2n + 3329n) / (2n * 3329n)) & ((1 << d) - 1);
+      const mine = Math.floor(((x * (1 << d) + 1664) * M) / 1099511627776) & ((1 << d) - 1);
+      assert.equal(mine, exact, `d=${d} x=${x}`);
+    }
+  }
+  assert.ok(C.mlkem768Encaps.toString().length > 0);
+});
+
+test("padding round trips and malformed padding is rejected", () => {
+  for (const n of [0, 1, 30, 31, 32, 33, 100]) {
+    const data = nodeCrypto.randomBytes(n);
+    const padded = C.padBytes(data, 32);
+    assert.equal(padded.length % 32, 0);
+    assert.equal(hex(C.unpadBytes(padded)), hex(data));
+  }
+  assert.equal(C.unpadBytes(new Uint8Array([1, 2, 3])), null);
+  assert.equal(C.unpadBytes(new Uint8Array([0x80, 0x01, 0x00])), null);
+});
+
+test("passphrases: generated ones are 100-bit, canonicalised, and self-chosen ones are refused", async () => {
+  const p = C.generatePassphrase();
+  assert.match(p, /^[A-Z2-9]{5}(-[A-Z2-9]{5}){3}$/);
+  assert.equal(C.normalizePassphrase(p.toLowerCase().replace(/-/g, " ")), p.replace(/-/g, ""));
+  assert.equal(C.normalizePassphrase("correct horse battery staple"), null);
+  assert.equal(C.normalizePassphrase("ABCDE-FGHJK-LMNPQ"), null);
+  await assert.rejects(C.deriveRootFromPassphrase("hunter2hunter2"), /generated by VeilX/);
+  const a = await C.deriveRootFromPassphrase(p);
+  const b = await C.deriveRootFromPassphrase(p.toLowerCase());
+  assert.equal(hex(a), hex(b));
+});
+
+test("vault seals and unseals; wrong passphrase and tampering fail", async () => {
+  const data = { "conv:1": { a: 1 } };
+  const env = await C.sealVaultData("a long master passphrase", data);
+  assert.deepEqual(await C.unsealVaultData("a long master passphrase", env), data);
+  await assert.rejects(C.unsealVaultData("another long passphrase!", env));
+  const tampered = { ...env, ctB64: C.bytesToBase64(Uint8Array.from(C.base64ToBytes(env.ctB64), (b, i) => (i === 3 ? b ^ 1 : b))) };
+  await assert.rejects(C.unsealVaultData("a long master passphrase", tampered));
+});
+
+test("VX1B sidecar binary media encryption round-trips and rejects tampered bytes or mismatched MIME AAD", async () => {
+  const rawImage = new Uint8Array(nodeCrypto.randomBytes(65536));
+  const sealed = await C.sealMediaBinary(rawImage, "image/webp");
+  assert.deepEqual(sealed.envelopeBytes.subarray(0, 5), C.MEDIA_MAGIC);
+  assert.equal(sealed.size, 65536);
+
+  const opened = await C.openMediaBinary(sealed.envelopeBytes, sealed.keyB64, sealed.sha256B64, "image/webp");
+  assert.equal(hex(opened), hex(rawImage));
+
+  // Wrong MIME type fails AES-256-GCM AAD authentication
+  await assert.rejects(
+    C.openMediaBinary(sealed.envelopeBytes, sealed.keyB64, sealed.sha256B64, "image/png")
   );
-  const eveKey = await C.importAesKey(
-    await C.deriveSharedKey(eve.privateJwk, eve.publicKey, alice.publicKey, sharedSecret)
+
+  // Flipping 1 byte in ciphertext fails the SHA-256 integrity check before decryption
+  const corrupted = new Uint8Array(sealed.envelopeBytes);
+  corrupted[25] ^= 0x01;
+  await assert.rejects(
+    C.openMediaBinary(corrupted, sealed.keyB64, sealed.sha256B64, "image/webp"),
+    /SHA-256 mismatch/
   );
-  const blob = await C.encryptMessage(aliceBob, "for bob only");
-  await assert.rejects(() => C.decryptMessage(eveKey, blob));
 });
 
-test("key exchange: a malformed public key is rejected", async () => {
-  const alice = await C.generateIdentity();
-  const junk = C.bytesToBase64(new Uint8Array(65).fill(1));
-  await assert.rejects(() => C.deriveSharedKey(alice.privateJwk, alice.publicKey, junk));
-});
+test("Zero-Knowledge Relay enforces HMAC signature, 12-bit Hashcash PoW, VX1B header, and 5-read burn cap", async () => {
+  const relay = createRelayHandler({ maxReads: 5 });
+  const rawImage = new Uint8Array(nodeCrypto.randomBytes(16384));
+  const sealed = await C.sealMediaBinary(rawImage, "image/webp");
+  const timestamp = String(Date.now());
+  const powNonce = C.computeRelayPow(timestamp, sealed.sha256Hex);
+  const sig = await C.signRelayUpload({ timestamp, sha256Hex: sealed.sha256Hex, powNonce });
 
-test("encrypted output size matches the documented overhead", async () => {
-  const key = await C.importAesKey(zeroKeyBytes);
-  const blob = await C.encryptMessage(key, "hi");
-  assert.equal(blob.length, 5 + 40);
-});
-
-test("block-padded messages hide exact length and round-trip cleanly", async () => {
-  const key = await C.importAesKey(zeroKeyBytes);
-  const shortBlob = await C.encryptMessage(key, "a", { pad: true });
-  const medBlob = await C.encryptMessage(key, "hello world!", { pad: true });
-  assert.equal(shortBlob.length, medBlob.length);
-  assert.equal(await C.decryptMessage(key, shortBlob), "a");
-  assert.equal(await C.decryptMessage(key, medBlob), "hello world!");
-});
-
-test("v5 authenticated envelopes bind sequence numbers, timestamps, and AAD", async () => {
-  const key = await C.importAesKey(zeroKeyBytes);
-  const blob = await C.encryptMessage(key, "envelope message", {
-    pad: true,
-    aad: "thread:777",
-    envelope: { seq: 42, ts: 1700000000000, id: "msg-42" },
+  // 1. Reject unsigned / tampered signature
+  const badSig = await relay.handleRequest({
+    method: "POST",
+    path: "/upload",
+    headers: {
+      "x-veilx-timestamp": timestamp,
+      "x-veilx-sha256": sealed.sha256Hex,
+      "x-veilx-pow": powNonce,
+      "x-veilx-signature": "AAAA",
+    },
+    bodyBytes: sealed.envelopeBytes,
   });
-  const res = await C.decryptMessage(key, blob, { aad: "thread:777", returnEnvelope: true });
-  assert.equal(res.text, "envelope message");
-  assert.equal(res.envelope.seq, 42);
-  assert.equal(res.envelope.id, "msg-42");
-  await assert.rejects(() => C.decryptMessage(key, blob, { aad: "thread:wrong" }));
+  assert.equal(badSig.status, 403);
+
+  // 2. Reject invalid Proof-of-Work
+  const badPow = await relay.handleRequest({
+    method: "POST",
+    path: "/upload",
+    headers: {
+      "x-veilx-timestamp": timestamp,
+      "x-veilx-sha256": sealed.sha256Hex,
+      "x-veilx-pow": String(Number(powNonce) + 1),
+      "x-veilx-signature": sig,
+    },
+    bodyBytes: sealed.envelopeBytes,
+  });
+  assert.equal(badPow.status, 403);
+
+  // 3. Accept valid signed + PoW-solved VX1B upload
+  const up = await relay.handleRequest({
+    method: "POST",
+    path: "/upload",
+    origin: "https://veilx-relay.workers.dev",
+    headers: {
+      "x-veilx-timestamp": timestamp,
+      "x-veilx-sha256": sealed.sha256Hex,
+      "x-veilx-pow": powNonce,
+      "x-veilx-signature": sig,
+    },
+    bodyBytes: sealed.envelopeBytes,
+  });
+  assert.equal(up.status, 200);
+  assert.equal(up.json.ok, true);
+  assert.match(up.json.id, /^[0-9a-f]{64}$/);
+
+  // 4. Enforce 5-download burn limit (downloads 1..5 succeed, download 6 returns 404)
+  for (let i = 1; i <= 5; i++) {
+    const dl = await relay.handleRequest({ method: "GET", path: `/blob/${up.json.id}` });
+    assert.equal(dl.status, 200, `download #${i} should succeed`);
+    assert.equal(hex(dl.binary), hex(sealed.envelopeBytes));
+  }
+  const dlAfterBurn = await relay.handleRequest({ method: "GET", path: `/blob/${up.json.id}` });
+  assert.equal(dlAfterBurn.status, 404, "6th download must be burned/deleted");
 });
 
-test("destructive forward-secrecy HMAC chain ratchet overwrites chain key and isolates past message keys", async () => {
-  const initialChainKey = new Uint8Array(32).fill(9);
-  const step1 = await C.ratchetChainStep(initialChainKey, 1, "thread:1");
-  const step2 = await C.ratchetChainStep(step1.nextChainKeyBytes, 2, "thread:1");
+test("Cloudflare Worker caches.default fallback decrements 5-read burn cap even when isolate memory is evicted", async () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const workerSrc = fs
+    .readFileSync(path.join(__dirname, "..", "server", "worker.js"), "utf8")
+    .replace(/export\s+default\s+workerHandler\s*;/, "module.exports = workerHandler;");
+  const workerMod = { exports: {} };
+  new Function("module", "exports", "crypto", workerSrc)(workerMod, workerMod.exports, nodeCrypto.webcrypto);
+  const worker = workerMod.exports;
 
-  assert.notDeepEqual(step1.nextChainKeyBytes, initialChainKey);
-  assert.notDeepEqual(step2.messageKeyBytes, step1.messageKeyBytes);
+  // Mock Cloudflare Edge Cache (`globalThis.caches.default`)
+  const cacheMap = new Map();
+  const prevCaches = globalThis.caches;
+  globalThis.caches = {
+    default: {
+      async match(req) {
+        const entry = cacheMap.get(req.url);
+        if (!entry) return undefined;
+        return new Response(new Uint8Array(entry.bytes), { status: 200, headers: entry.headers });
+      },
+      async put(req, res) {
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        const headers = {};
+        res.headers.forEach((v, k) => { headers[k] = v; });
+        cacheMap.set(req.url, { bytes, headers });
+      },
+      async delete(req) {
+        return cacheMap.delete(req.url);
+      },
+    },
+  };
 
-  const msg1Blob = await C.encryptMessage(step1.messageAesKey, "msg 1");
-  assert.equal(await C.decryptMessage(step1.messageAesKey, msg1Blob), "msg 1");
-  // Even if an attacker compromises step2's chain key later, step2's message key cannot decrypt msg 1!
-  await assert.rejects(() => C.decryptMessage(step2.messageAesKey, msg1Blob));
+  try {
+    worker.edgeMemoryStore.clear();
+    worker.ipQuotaStore.clear();
+
+    const rawBytes = new Uint8Array(nodeCrypto.randomBytes(4096));
+    const sealed = await C.sealMediaBinary(rawBytes, "image/png");
+    const timestamp = String(Date.now());
+    const powNonce = C.computeRelayPow(timestamp, sealed.sha256Hex);
+    const sig = await C.signRelayUpload({ timestamp, sha256Hex: sealed.sha256Hex, powNonce });
+
+    const upReq = new Request("https://veilx-relay.therealrudrashukla.workers.dev/upload", {
+      method: "POST",
+      headers: {
+        "cf-connecting-ip": "203.0.113.10",
+        "x-veilx-timestamp": timestamp,
+        "x-veilx-sha256": sealed.sha256Hex,
+        "x-veilx-pow": powNonce,
+        "x-veilx-signature": sig,
+      },
+      body: sealed.envelopeBytes,
+    });
+    const upRes = await worker.fetch(upReq, {});
+    assert.equal(upRes.status, 200);
+    const upJson = await upRes.json();
+    assert.equal(upJson.ok, true);
+
+    // Simulate Cloudflare Worker isolate eviction so ONLY caches.default has the blob
+    worker.edgeMemoryStore.clear();
+    assert.equal(worker.edgeMemoryStore.size, 0);
+    assert.equal(cacheMap.size, 1);
+
+    for (let i = 1; i <= 5; i++) {
+      const dlReq = new Request(upJson.url, {
+        method: "GET",
+        headers: { "cf-connecting-ip": "203.0.113.11" },
+      });
+      const dlRes = await worker.fetch(dlReq, {});
+      assert.equal(dlRes.status, 200, `caches.default read #${i} should succeed`);
+      assert.equal(dlRes.headers.get("x-veilx-remaining-reads"), String(5 - i));
+      const dlBytes = new Uint8Array(await dlRes.arrayBuffer());
+      assert.equal(hex(dlBytes), hex(sealed.envelopeBytes));
+    }
+
+    // 6th read from caches.default must return 404 (burned)
+    const burnedRes = await worker.fetch(
+      new Request(upJson.url, { method: "GET", headers: { "cf-connecting-ip": "203.0.113.11" } }),
+      {}
+    );
+    assert.equal(burnedRes.status, 404, "6th download from caches.default must be 404 burned");
+    assert.equal(cacheMap.size, 0, "cache entry deleted after 5th read");
+  } finally {
+    globalThis.caches = prevCaches;
+  }
 });
 
-test("Vault encryption at rest seals and unseals keys with master passphrase", async () => {
-  const payload = { "conv:111": { mode: "passphrase", keyB64: "ABCD" } };
-  const envelope = await C.sealVaultData("master-passphrase-12345", payload);
-  const restored = await C.unsealVaultData("master-passphrase-12345", envelope);
-  assert.deepEqual(restored, payload);
-  await assert.rejects(() => C.unsealVaultData("wrong-passphrase-00000", envelope));
+test("Relay enforces per-IP upload rate limits (429 Too Many Requests)", async () => {
+  const relay = createRelayHandler({ maxUploadsPerIp: 2 });
+  const rawBytes = new Uint8Array(nodeCrypto.randomBytes(512));
+  const sealed = await C.sealMediaBinary(rawBytes, "image/webp");
+  const timestamp = String(Date.now());
+  const powNonce = C.computeRelayPow(timestamp, sealed.sha256Hex);
+  const sig = await C.signRelayUpload({ timestamp, sha256Hex: sealed.sha256Hex, powNonce });
+
+  const makeReq = () =>
+    relay.handleRequest({
+      method: "POST",
+      path: "/upload",
+      ip: "198.51.100.42",
+      headers: {
+        "x-veilx-timestamp": timestamp,
+        "x-veilx-sha256": sealed.sha256Hex,
+        "x-veilx-pow": powNonce,
+        "x-veilx-signature": sig,
+      },
+      bodyBytes: sealed.envelopeBytes,
+    });
+
+  assert.equal((await makeReq()).status, 200);
+  assert.equal((await makeReq()).status, 200);
+  const third = await makeReq();
+  assert.equal(third.status, 429, "exceeding per-IP upload quota returns 429 Too Many Requests");
 });

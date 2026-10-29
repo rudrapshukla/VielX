@@ -1,148 +1,97 @@
-# VeilX v5.2.0 — Post-Quantum End-to-End Encryption & Studio for Instagram Direct
+# VeilX 1.1.0 — Post-Quantum End-to-End Encrypted Text, Original-Quality Images, Short Videos & Voice Notes for Instagram Direct
 
-**VeilX** is a zero-dependency Chrome Manifest V3 extension that brings client-side, post-quantum hybrid authenticated encryption (**NIST FIPS 203 ML-KEM-768 + ECDH P-256 + AES-256-GCM**) to Instagram Direct Messages while isolating message composition inside a cross-origin `chrome-extension://` sandbox so the host webpage can never inspect your keystrokes or plaintext.
+VeilX is a Chrome (Manifest V3) extension that adds end-to-end encryption on top of Instagram Direct messages. Messages, original-quality images, short videos, and voice notes are encrypted inside an isolated extension-origin iframe so only ciphertext (`VX1:…`) ever reaches Instagram.
 
-> *असतो मा सद्गमय*
-> *Lead me from falsehood to truth.*
-> — Bṛhadāraṇyaka Upaniṣad, 1.3.28
+## What it does
 
-## Key Capabilities
+* **Hybrid post-quantum key exchange:** ML-KEM-768 (FIPS 203) + ephemeral ECDH P-256. An attacker must break both.
+* **Forward secrecy:** fresh ephemeral keys per exchange, no long-term identity key, per-direction hash-ratchet chains with message keys used once and deleted.
+* **Authenticated everything:** AES-256-GCM with header, direction, sequence number and conversation id bound as AAD. Replays, reflections, reordering and cross-chat splicing are detected.
+* **Verification by default:** a 128-bit safety code covers the whole handshake transcript; sending is blocked until you confirm it with your contact.
+* **Original-fidelity encrypted media sidecars (1 DM):** attaches or drops original-quality images (`image/png`, `image/jpeg`, `image/webp`, `image/gif`), short videos (`video/mp4`, `video/webm`, `video/quicktime`), and audio/voice notes (`audio/*` or live `🎙 Voice` recordings up to 15 MB). The **Sidecar Relay path bypasses `<canvas>` resizing and re-encoding completely**, encrypting the original file bytes bit-for-bit (`VX1B\x01` + fresh 256-bit AES-256-GCM key + 96-bit IV + MIME AAD) and sending **only 1 compact `VX1:` pointer DM** over Instagram Direct.
+* **Offline in-band fallback (images):** if the relay is unreachable, images can fall back to multi-chunk in-band `VX1:` messages (resized to fit Instagram's message rate limits).
+* **Least-privilege host permissions:** `manifest.json` grants access strictly to Instagram/Facebook domains (`https://www.instagram.com/*`, `https://*.instagram.com/*`, `https://*.facebook.com/*`), the configured Cloudflare Worker relay (`https://veilx-relay.therealrudrashukla.workers.dev/*`), and local loopback (`http://127.0.0.1/*`, `http://localhost/*`) — never wildcard `https://*/*`.
+* **Fail-closed composer:** you type and attach media in an extension-origin iframe. Typing in Instagram's own box is blocked, never sent.
+* **Key Vault** (encrypt stored keys + history under a passphrase while away) and a direct launcher for the standalone **VeilX Web Messenger** (`https://veilxweb.onrender.com`).
+* **Passphrase mode** for a quick shared secret — generated 100-bit passphrases only, and clearly labelled *no forward secrecy*.
 
-* **Cross-Origin Keystroke & Plaintext Isolation:** Replaces Instagram's native Lexical input box with a dedicated `chrome-extension://` iframe pill composer (`composer/composer.html`). Typing events (`keydown`, `beforeinput`, `input`, `paste`) fire strictly inside the extension's isolated browsing context and never enter Instagram's DOM or `window` capture listeners.
-* **Zero-`postMessage` Privileged IPC Broker:** Encryption happens inside the composer iframe before any data leaves the frame. Only finished `GPV2:...` ciphertexts traverse `chrome.runtime.sendMessage` through the extension Service Worker (`src/background.js`) to the content script (`src/content.js`).
-* **Standardized Post-Quantum Hybrid Key Exchange:** Combines **NIST FIPS 203 ML-KEM-768** (`k=3, n=256, q=3329`, 32-bit interleaved **FIPS 202 Keccak-f[1600]**, Number-Theoretic Transform, and Fujisaki-Okamoto implicit rejection) with classical **NIST P-256 ECDH** via `HKDF-SHA256`.
-* **Automatic Multi-Packet Wire Framing:** Splits 1,249-byte hybrid public keys and 1,088-byte ML-KEM-768 capsules into compact `< 880`-character `GPV2K:P1/N#<bundleId>#...` packets that fit cleanly within Instagram Direct's 1,000-character message limit and reassemble automatically on arrival.
-* **Destructive Forward-Secrecy Symmetric Chain Ratchet:** Advances a 256-bit conversation chain key via one-way `HMAC-SHA256` steps (`ratchetChainStep`) and overwrites previous chain keys on disk so future storage compromise cannot recover past message keys.
-* **AES-256-GCM Envelopes & Traffic-Analysis Padding:** Encrypts every message with a fresh 96-bit random IV, 128-bit authentication tag, monotonic sequence numbers, multi-part message chunking, and 32-byte **ISO/IEC 7816-4** block padding (`0x80 0x00...`) to mask exact character lengths of short messages.
-* **Master Key Vault at Rest:** Seals all conversation keys and identity private keys in `chrome.storage.local` under a master passphrase using **PBKDF2-HMAC-SHA256** (600,000 iterations, 128-bit random salt) and **AES-256-GCM**.
-* **VeilX Studio Standalone Web App:** Includes a full-window split-screen workspace (`app/app.html`) that embeds Instagram Direct alongside a dedicated Quantum Security Command Deck using `declarativeNetRequest` session rules.
-* **Zero Third-Party Runtime Dependencies:** Ships 100% self-contained JavaScript at runtime with zero external `npm` packages, eliminating supply-chain key exfiltration risks.
+Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for exactly what is and is not protected, including the public prototype relay abuse-control model. In short: post-quantum crypto does not authenticate anyone — **compare the safety code**.
 
-## Cryptographic & Architectural Specification
+## Protocol (summary)
 
-| Component | Standard / Primitive | Implementation Details |
-| :--- | :--- | :--- |
-| **Post-Quantum KEM** | NIST FIPS 203 ML-KEM-768 | Module-LWE (`k=3, n=256, q=3329, eta1=2, eta2=2, du=10, dv=4`), 1,184-byte `ek`, 2,400-byte `dk`, 1,088-byte ciphertext `c`, FO implicit rejection |
-| **Sponge & XOF Hash** | NIST FIPS 202 Keccak-f[1600] | 32-bit lane-interleaved `Uint32Array` state powering `SHA3-256`, `SHA3-512`, `SHAKE128`, and `SHAKE256` |
-| **Classical Key Agreement** | WebCrypto ECDH P-256 | 65-byte uncompressed NIST P-256 public point combined with ML-KEM-768 (`1,249-byte` hybrid public bundle) |
-| **Hybrid Key Derivation** | WebCrypto HKDF-SHA256 | Extracts & expands concatenated 32-byte ECDH secret + 32-byte ML-KEM-768 secret with sorted public-key salt |
-| **Symmetric Encryption** | WebCrypto AES-256-GCM | 256-bit key, 96-bit CSPRNG IV per message, 128-bit GHASH authentication tag, ISO/IEC 7816-4 32-byte block padding |
-| **Forward-Secrecy Ratchet** | WebCrypto HMAC-SHA256 | One-way PRF deriving `MK_n = HMAC(CK_n, 0x01)` and `CK_{n+1} = HMAC(CK_n, 0x02)` with destructive key overwrite |
-| **Passphrase & Vault KDF** | WebCrypto PBKDF2-SHA256 | 600,000 iterations, NFKC normalization, 100-bit 20-character base-32 passphrase generator (`XXXX-XXXX-XXXX-XXXX`) |
-| **MITM Verification** | 80-bit SHA-256 Safety Code | Five 4-hex-character blocks (`A1B2 C3D4 E5F6 7788 99AA`) computed over sorted hybrid public key bundles |
+```
+Initiator → Responder   OFFER = ecPubI(65) ‖ mlkemEk(1184)
+Responder → Initiator   REPLY = ecPubR(65) ‖ mlkemCt(1088) ‖ H(OFFER)[0:16]
+TH   = SHA-256("veilx-v1-transcript" ‖ OFFER ‖ ecPubR ‖ mlkemCt)
+root = HKDF-SHA256(ECDH(ephI,ephR) ‖ mlkemSS, salt = TH, info = "veilx-v1-root")
+→ conversation id, two sender ids, two chain keys, safety code (all HKDF from root);
+  ephemeral private keys and the root are then discarded.
+message i:  mk = HMAC(ck, 0x01);  ck' = HMAC(ck, 0x02)
+wire:       "VX1:" ‖ b64( 0x01 ‖ sid(8) ‖ seq(4) ‖ iv(12) ‖ AES-256-GCM(padded JSON) )
+AAD:        "veilx-v1-msg" ‖ header ‖ conversationId
 
-## System Architecture & Execution Contexts
-
-VeilX v5.2.0 partitions execution across five browser contexts to enforce strict privilege separation:
-
-1. **Extension Composer Iframe (`composer/composer.html`, `composer.js`, `composer.css`):**
-   Runs inside a `chrome-extension://` origin mounted in the Instagram chat footer. Captures user input in an isolated window, splits long messages into UTF-8 chunks, encrypts each chunk with `AES-256-GCM`, and dispatches only `GPV2:...` ciphertexts over `chrome.runtime.sendMessage`.
-2. **MV3 Service Worker Broker (`src/background.js`):**
-   Relays privileged `GPV_BROKER_SEND_CIPHERTEXT` and `GPV_BROKER_SEND_KEY` commands between the composer iframe and the active tab's content script via `chrome.tabs.sendMessage`, and configures `declarativeNetRequest` session rules (`5001`–`5004`) so VeilX Studio can embed Instagram Direct with full WebSocket/MQTT and GraphQL functionality.
-3. **Content Script Conductor (`src/content.js`, `src/dom.js`, `src/ui.js`, `src/styles.js`):**
-   Executes in Chrome's Isolated World on `instagram.com`. Hides Instagram's native Lexical textbox off-screen while keeping its React Fiber node mounted, atomically writes `GPV2:...` ciphertexts into the hidden editor on send, reassembles multi-packet `GPV2K:` handshakes, and renders decrypted messages inside closed Shadow DOM roots (`attachShadow({ mode: "closed" })`).
-4. **Popup Control Center (`popup/popup.html`, `popup.js`, `popup.css`):**
-   Centralizes all conversation security controls, master encryption toggles, 100-bit passphrase generation, ML-KEM-768 key exchange initiation, 80-bit Safety Code verification, Master Key Vault locking/unlocking, and the **Open VeilX Studio** launcher.
-5. **VeilX Studio Standalone Web App (`app/app.html`, `app.js`, `app.css`):**
-   A full-page extension workspace providing a persistent Quantum Security Command Deck on the left and a live embedded Instagram Direct client on the right.
+Media Sidecar (VX1B):
+envelope:   "VX1B\x01"(5) ‖ iv(12) ‖ AES-256-GCM_k(originalFileBytes, AAD="veilx-v1-media:" ‖ mimeType)
+chat DM:    1 forward-secret VX1: message carrying { t: "img_ref", u: blobUrl, k: keyB64, h: sha256(envelope), mt: mimeType, sz: byteLen }
+```
 
 ## Installation
 
-1. Clone or download this repository to your machine:
-   ```bash
-   git clone https://github.com/rudrapshukla/guptavarta.git
-   cd guptavarta
-   ```
-2. Open Google Chrome (or any Chromium-based browser, version 111+) and navigate to `chrome://extensions/`.
-3. Enable **Developer mode** using the toggle in the top-right corner.
-4. Click **Load unpacked** in the top-left corner and select the root folder of this repository (the folder containing `manifest.json`).
-5. Pin **VeilX** to your browser toolbar and open `https://www.instagram.com/direct/inbox/`.
+1. Download or extract this archive.
+2. In Chrome (111+), open `chrome://extensions/` and enable **Developer mode**.
+3. Click **Load unpacked** and select the `VeilX` folder that contains `manifest.json`.
+4. Pin **VeilX** and open `https://www.instagram.com/direct/inbox/`.
 
-## How to Use
+## Deploying Your Own Zero-Knowledge Relay (`server/`)
 
-### Method 1: Post-Quantum Hybrid Key Exchange (Recommended)
-1. Open an Instagram Direct conversation with a contact who also has VeilX installed.
-2. Click **Exchange Key** in the on-page VeilX chat bar (or open the VeilX toolbar popup, select **Key Exchange**, and click **Send my key into chat**).
-3. VeilX sends your 1,249-byte **ML-KEM-768 + P-256** public key as compact `GPV2K:` packets.
-4. When your contact clicks **Accept PQ Key** / **Send my key**, their extension encapsulates a 256-bit ML-KEM-768 secret and replies with their hybrid capsule.
-5. Both sides automatically derive the shared 256-bit **AES-256-GCM** key. Optional: open the VeilX popup to compare the **80-bit Safety Code** with your contact and click **Verify safety code**.
-6. Type in the Purplish-Bluish VeilX pill composer and press **Enter** or **Send**.
+The extension defaults to the hosted public prototype relay (`https://veilx-relay.therealrudrashukla.workers.dev`). To deploy your own Cloudflare Worker or run the local loopback relay:
 
-### Method 2: Shared 100-Bit Passphrase
-1. Open an Instagram Direct conversation and click the **VeilX** toolbar icon.
-2. Under the **Shared Passphrase** tab, click **Generate** to create a 100-bit cryptographic passphrase (or enter your own 12+ character passphrase), click **Copy**, and share it with your contact over a trusted channel.
-3. Click **Save Key**. Both you and your contact can immediately send and receive encrypted messages in the chat.
+```powershell
+cd server
+# Mode A: Zero-R2 Free Tier (Cloudflare Edge Cache + Isolate Memory with 5-read burn enforcement)
+npx.cmd wrangler deploy worker.js --config wrangler.toml
 
-### Using VeilX Studio & Master Key Vault(Studio send messege but on the sender size update happen only after when they refresh the page)
-* **VeilX Studio:** Click **Open VeilX Studio ↗** at the top of the VeilX popup to open the standalone split-screen web app (`app/app.html`).
-* **Master Key Vault:** In the popup or Studio sidebar, enter a 12+ character master passphrase under **Master Key Vault** and click **Lock Vault** when stepping away from your device. All stored conversation keys and private keys are encrypted into a single `AES-256-GCM` vault blob and wiped from plaintext storage until unlocked.
+# Mode B: Durable Cloudflare R2 Storage (Optional)
+npx.cmd wrangler r2 bucket create veilx-encrypted-media
+npx.cmd wrangler deploy worker.js --config wrangler.toml --env r2
 
-## Project Structure
-
-```text
-├── manifest.json             # Chrome Manifest V3 configuration & CSP
-├── package.json              # Project metadata & Node test script
-├── src/
-│   ├── background.js         # MV3 Service Worker IPC broker & declarativeNetRequest rules
-│   ├── crypto.js             # FIPS 202 Keccak, FIPS 203 ML-KEM-768, ECDH P-256, HKDF, HMAC ratchet, AES-256-GCM, Vault
-│   ├── store.js              # chrome.storage.local state manager, key history & Vault operations
-│   ├── util.js               # URL thread-ID parser, UTF-8 byte counter & multi-chunk splitter
-│   ├── dom.js                # Scoped Instagram DOM selectors, sidebar filter & atomic Lexical writer
-│   ├── ui.js                 # Closed Shadow DOM factory, encrypted bubble renderer & iframe mounter
-│   ├── styles.js             # Purplish-Bluish Electric Indigo & Violet themes for Shadow DOM & Instagram UI
-│   └── content.js            # Content script conductor, multi-packet KEM handshake & live-DOM replay guard
-├── composer/
-│   ├── composer.html         # Cross-origin extension composer iframe markup
-│   ├── composer.css          # Single-line Purplish-Bluish pill composer styling
-│   └── composer.js           # In-frame AES-256-GCM encryption & chrome.runtime IPC sender
-├── popup/
-│   ├── popup.html            # Toolbar Control Center markup
-│   ├── popup.css             # Popup stylesheet
-│   └── popup.js              # Passphrase, ML-KEM-768 handshake, Safety Code & Vault controller
-├── app/
-│   ├── app.html              # VeilX Studio standalone split-screen web app markup
-│   ├── app.css               # VeilX Studio stylesheet
-│   └── app.js                # VeilX Studio controller
-├── tests/
-│   ├── dom_harness.js        # Zero-dependency W3C Shadow DOM, composed event & iframe simulator
-│   ├── crypto.test.js        # Cryptographic unit tests (ML-KEM-768, FO rejection, ratchet, padding, Vault)
-│   ├── content.smoke.test.js # End-to-end DOM, cross-origin iframe isolation & handshake integration tests
-│   └── popup.smoke.test.js   # Popup Control Center & Vault UI integration tests
-└── docs/
-    └── THREAT_MODEL.md       # Formal security boundaries and threat model
+# Optional: Private Operator Secret (set in Cloudflare + VeilX Popup -> Relay Auth Key)
+npx.cmd wrangler secret put RELAY_SECRET
 ```
 
-## Running the Automated Test Suite
+## Project structure
 
-VeilX uses Node.js's built-in test runner (`node:test` and `node:assert`) and WebCrypto API (`node:crypto`) with zero external packages required:
+```
+manifest.json            MV3 manifest (narrowed host permissions; composer is the only web-accessible page)
+src/crypto.js            Keccak, ML-KEM-768, WebCrypto wrappers, VX1B binary encryption, relay PoW
+src/protocol.js          Handshake, ratchet, wire format, key packets (pure functions)
+src/session.js           Session state machine, chains, replay protection, media sidecars, local history
+src/store.js             Storage, locking, Key Vault
+src/content.js           Page script: scan, decrypt, key exchange, media sidecar fetch, fail-closed guards
+src/dom.js, ui.js, styles.js, util.js   Instagram DOM helpers and closed shadow-DOM UI (<img>, <video>, <audio>)
+src/background.js        Composer→page broker & Zero-Knowledge Relay proxy
+composer/                Extension-origin composer iframe (text, original-byte media attach/drop, live voice notes)
+popup/                   Obsidian Black Control Center & veilxweb.onrender.com launcher
+server/                  Cloudflare Worker (worker.js, wrangler.toml) + Node loopback relay (local-relay.js)
+tests/                   crypto, protocol, background, popup, content (DOM) tests + kat.json
+docs/THREAT_MODEL.md
+```
+
+## Tests
 
 ```bash
-npm test
-# or run directly with Node.js (v18+):
-node --test tests/crypto.test.js tests/popup.smoke.test.js tests/content.smoke.test.js
+npm test          # node --test tests/*.test.js
 ```
 
-The 46-test suite verifies:
-* **NIST FIPS 203 ML-KEM-768 & ECDH P-256 Hybrid KEM:** Key generation, encapsulation, decapsulation, Fujisaki-Okamoto implicit rejection of tampered ciphertexts, and multi-packet `< 1,000`-character wire framing.
-* **Cross-Origin Composer Isolation:** Confirms zero `keydown`, `beforeinput`, or `window.postMessage` events leak to Instagram's `window` or `document` capture listeners during typing and sending.
-* **Symmetric Cryptography & Ratcheting:** `AES-256-GCM` encryption/decryption, 32-byte ISO/IEC 7816-4 traffic-analysis padding, authenticated envelopes, destructive `HMAC-SHA256` chain ratcheting, and `PBKDF2-SHA256` (600,000 iterations) key derivation.
-* **Live-DOM Replay & Virtual-Scroller Safety:** Verifies that React virtual-scroller re-renders, sidebar previews, and simultaneous multi-device handshakes decrypt cleanly while genuine duplicate replay bubbles are blocked.
-* **Master Key Vault:** Verifies full at-rest encryption and restoration of keys in `chrome.storage.local`.
+* **crypto & relay:** SHA-3/SHAKE vs OpenSSL; ML-KEM-768 known answers (`tests/kat.json`); FIPS 203 modulus and decapsulation-key checks; `VX1B` binary authenticated encryption; Cloudflare Worker `caches.default` 5-read burn cap enforcement even after cold isolate memory eviction; per-IP upload/byte/download rate limiting (`429 Too Many Requests`).
+* **protocol:** handshake & matching safety codes, verification gating, forward-secrecy property, reorder / replay / reflection / tamper / forged-sequence cases, simultaneous offers, spliced key packets, chunking, passphrase mode, vault round trip.
+* **background:** all network rules are tab-scoped; broker accepts only the composer and only targets the sender's tab.
+* **popup / content:** real extension files in a simulated page — no keyboard events or window messages leak, only ciphertext reaches the send box, native-box typing is blocked, full exchange and messaging through the DOM, bit-for-bit original image (`<img>`), short video (`<video>`), and voice note (`<audio>`) sidecar delivery in 1 DM.
 
-## Security Threat Model & Boundaries
+## Limitations
 
-* **Protected Against:**
-  * Host-page keystroke harvesting (`keydown` / `beforeinput` / `input` capture listeners on `instagram.com`).
-  * Host-page `window.addEventListener("message")` bridge sniffing (zero `window.postMessage` traffic).
-  * Host-page DOM scraping of decrypted messages (`attachShadow({ mode: "closed" })`).
-  * Classical and future quantum passive eavesdropping (*"Harvest Now, Decrypt Later"*) via hybrid **NIST FIPS 203 ML-KEM-768 + ECDH P-256** and **AES-256-GCM**.
-  * Active key substitution when users verify the **80-bit Safety Code** out-of-band.
-  * Unencrypted disk inspection when the **Master Key Vault** is locked.
-* **Out of Scope / Limitations:**
-  * Media attachments (photos, videos, voice notes) sent through Instagram's native media uploaders are not encrypted by VeilX.
-  * Conversation metadata (participants, message timestamps, and approximate packet count) remains visible to Instagram's servers.
-  * Like any browser extension, VeilX cannot protect secrets against a compromised operating system, malicious root/admin processes, or a compromised browser binary while the vault is unlocked.
+JavaScript cryptography is not constant-time and is not independently audited or FIPS-validated. Decrypted history is stored locally in plaintext (sealed by the Key Vault when locked). See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
-## License & Credits
+## License
 
-Created by Rudra Pratap Shukla(https://github.com/rudrapshukla). Released under the [MIT License](LICENSE).
+Created by Rudra Pratap Shukla. Released under the [MIT License](LICENSE).

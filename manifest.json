@@ -1,20 +1,21 @@
 {
   "manifest_version": 3,
   "name": "VeilX",
-  "version": "5.2.0",
-  "description": "NIST FIPS 203 ML-KEM-768 + ECDH P-256 + AES-256-GCM encryption & VeilX Studio for Instagram Direct.",
-  "author": "Team Monolith",
-  "homepage_url": "https://github.com/rudrapshukla",
+  "version": "1.2.0",
+  "description": "Hybrid post-quantum (ML-KEM-768 + P-256) end-to-end encryption with forward secrecy and encrypted media sidecars for Instagram Direct.",
+  "author": "Team Monolith (Rudra Pratap Shukla)",
+  "homepage_url": "https://veilxweb.onrender.com",
   "minimum_chrome_version": "111",
   "permissions": [
-    "storage",
-    "activeTab",
-    "declarativeNetRequest"
+    "storage"
   ],
   "host_permissions": [
     "https://www.instagram.com/*",
     "https://*.instagram.com/*",
-    "https://*.facebook.com/*"
+    "https://*.facebook.com/*",
+    "https://veilx-relay.therealrudrashukla.workers.dev/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
   ],
   "background": {
     "service_worker": "src/background.js"
@@ -38,8 +39,7 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "composer/composer.html",
-        "app/app.html"
+        "composer/composer.html"
       ],
       "matches": [
         "https://www.instagram.com/*",
@@ -56,8 +56,10 @@
       ],
       "js": [
         "src/crypto.js",
+        "src/protocol.js",
         "src/util.js",
         "src/store.js",
+        "src/session.js",
         "src/styles.js",
         "src/dom.js",
         "src/ui.js",

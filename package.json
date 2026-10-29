@@ -1,11 +1,11 @@
 {
   "name": "veilx",
-  "version": "5.2.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "NIST FIPS 203 ML-KEM-768 + ECDH P-256 + AES-256-GCM encryption & VeilX Studio for Instagram Direct",
+  "description": "Hybrid post-quantum (ML-KEM-768 + P-256) end-to-end encryption with forward secrecy for Instagram Direct",
   "license": "MIT",
   "scripts": {
-    "test": "node --test tests/crypto.test.js tests/content.smoke.test.js tests/popup.smoke.test.js"
+    "test": "node --test"
   },
   "devDependencies": {
     "jsdom": "^24.0.0"

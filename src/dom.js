@@ -17,13 +17,13 @@
  *        while keeping it mounted in the DOM so React does not crash.
  *     2. We mount VeilX's own closed-Shadow-DOM composer in its place.
  *     3. Only when the user presses Enter or Send—after AES-256-GCM encryption
- *        completes—do we atomically inject the `GPV2:...` ciphertext into
+ *        completes—do we atomically inject the `VX1:...` ciphertext into
  *        Instagram's hidden Lexical input and trigger submission.
  */
 
-globalThis.GPV = globalThis.GPV || {};
+globalThis.VX = globalThis.VX || {};
 
-GPV.dom = (() => {
+VX.dom = (() => {
   "use strict";
 
   const INPUT_SELECTOR = [
@@ -52,7 +52,7 @@ GPV.dom = (() => {
 
   const PAGE_STYLE_ID = "veilx-nova-page-styles";
   const HIDDEN_ATTR = "data-veilx-hidden-composer";
-  const HANDLED_ATTR = "data-gpv-handled";
+  const HANDLED_ATTR = "data-vx-handled";
 
   function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -63,7 +63,7 @@ GPV.dom = (() => {
   }
 
   function getThreadId() {
-    return GPV.util.threadIdFromUrl(location.href);
+    return VX.util.threadIdFromUrl(location.href);
   }
 
   function findMessageInput() {
@@ -105,10 +105,10 @@ GPV.dom = (() => {
   function applyPageTheme(beautifyEnabled) {
     if (!document.head && !document.documentElement) return;
     let styleEl = document.getElementById(PAGE_STYLE_ID);
-    if (!styleEl && GPV.styles && GPV.styles.pageThemeCss) {
+    if (!styleEl && VX.styles && VX.styles.pageThemeCss) {
       styleEl = document.createElement("style");
       styleEl.id = PAGE_STYLE_ID;
-      styleEl.textContent = GPV.styles.pageThemeCss;
+      styleEl.textContent = VX.styles.pageThemeCss;
       (document.head || document.documentElement).appendChild(styleEl);
     }
     if (document.documentElement) {
@@ -122,11 +122,8 @@ GPV.dom = (() => {
 
   function getConversationPane(input) {
     if (input) {
-      // In a real browser layout on Instagram Direct, walk up from the composer
-      // to find the right-hand active chat column BEFORE reaching the two-column
-      // wrapper that also includes the left-hand Inbox thread list sidebar!
       const anchor =
-        document.querySelector('[data-gpv-composer-host="1"]') || input;
+        document.querySelector('[data-vx-composer-host="1"]') || input;
       if (typeof anchor.getBoundingClientRect === "function") {
         let cur = anchor.parentElement || input.parentElement;
         while (cur && cur !== document.body) {
@@ -176,16 +173,16 @@ GPV.dom = (() => {
     const expected = text.trim();
 
     input.focus();
-    await wait(60);
+    await wait(25);
     replaceAllText(input, text);
-    await wait(50);
+    await wait(25);
     if (readInputText(input) === expected) return true;
 
     input.innerHTML = "<p><br></p>";
     input.focus();
-    await wait(40);
+    await wait(25);
     replaceAllText(input, text);
-    await wait(40);
+    await wait(25);
     if (readInputText(input) === expected) return true;
 
     input.textContent = text;
@@ -239,7 +236,7 @@ GPV.dom = (() => {
 
     if (typeof el.getBoundingClientRect === "function") {
       const composerHost =
-        document.querySelector('[data-gpv-composer-host="1"]') ||
+        document.querySelector('[data-vx-composer-host="1"]') ||
         findMessageInput();
       if (composerHost && typeof composerHost.getBoundingClientRect === "function") {
         const compRect = composerHost.getBoundingClientRect();
@@ -277,11 +274,6 @@ GPV.dom = (() => {
       const text = cleanMessageText(el.textContent);
       if (!prefixes.some((p) => text.startsWith(p))) continue;
 
-      // ALWAYS skip outer containers (`div[dir="auto"]`) if any inner descendant
-      // (`span[data-lexical-text="true"]` or `span[dir="auto"]`) also starts with
-      // a GPV prefix! Modifying an outer `div[dir="auto"]` that also wraps Instagram's
-      // "Sending..." status node breaks React Fiber reconciliation and causes duplicate
-      // decryption of both the inner span and outer div!
       const hasInnerMatch = Array.from(
         el.querySelectorAll(MESSAGE_TEXT_SELECTOR)
       ).some((inner) =>
@@ -292,8 +284,8 @@ GPV.dom = (() => {
       const next = el.nextElementSibling;
       const handled = Boolean(
         el.hasAttribute(HANDLED_ATTR) ||
-          (next && next.hasAttribute("data-gpv-host")) ||
-          el.querySelector(`[${HANDLED_ATTR}], [data-gpv-host]`)
+          (next && next.hasAttribute("data-vx-host")) ||
+          el.querySelector(`[${HANDLED_ATTR}], [data-vx-host]`)
       );
 
       results.push({ el, text, handled });
@@ -319,4 +311,4 @@ GPV.dom = (() => {
   };
 })();
 
-if (typeof module !== "undefined") module.exports = GPV.dom;
+if (typeof module !== "undefined") module.exports = VX.dom;

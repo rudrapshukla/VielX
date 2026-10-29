@@ -1,0 +1,18 @@
+# server/wrangler.toml — Cloudflare Worker Configuration for VeilX Relay
+#
+# Mode 1: Free Cloudflare Worker (Zero-R2 Prototype Mode — uses Edge Cache + Isolate Memory):
+#   npx.cmd wrangler deploy worker.js --config wrangler.toml
+#
+# Mode 2: Production Durable R2 Mode (Once R2 is enabled in Cloudflare Dashboard):
+#   npx.cmd wrangler r2 bucket create veilx-encrypted-media
+#   npx.cmd wrangler deploy worker.js --config wrangler.toml --env r2
+
+name = "veilx-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[env.r2]
+name = "veilx-relay"
+[[env.r2.r2_buckets]]
+binding = "VEILX_BUCKET"
+bucket_name = "veilx-encrypted-media"

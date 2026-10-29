@@ -1,25 +1,27 @@
 /**
- * src/ui.js — VeilX v5.0 UI Components:
- *   1. Encrypted / Decrypted message bubbles
+ * src/ui.js — VeilX v1.0.0 UI Components:
+ *   1. Encrypted / Decrypted message, Original-Fidelity Image, Short Video, and Voice Note bubbles
  *   2. Key-exchange status badges (`ML-KEM-768`)
  *   3. Cross-Origin `chrome-extension://` Iframe Composer (communicating strictly
  *      via `chrome.runtime` — ZERO `window.parent.postMessage` listeners!)
  *   4. Purplish-Bluish Floating Notices (Toasts)
  */
 
-globalThis.GPV = globalThis.GPV || {};
+globalThis.VX = globalThis.VX || {};
 
-GPV.ui = (() => {
+VX.ui = (() => {
   "use strict";
 
-  const HOST_ATTRIBUTE = "data-gpv-host";
-  const COMPOSER_HOST_ATTRIBUTE = "data-gpv-composer-host";
+  const HOST_ATTRIBUTE = "data-vx-host";
+  const COMPOSER_HOST_ATTRIBUTE = "data-vx-composer-host";
+  const SAFE_MEDIA_DATA_URL_RE =
+    /^data:((?:image\/(?:webp|png|jpeg|jpg|gif))|(?:video\/(?:mp4|webm|quicktime))|(?:audio\/(?:webm|ogg|mp4|mpeg|mp3|wav|x-m4a)))(?:;codecs=[^;,]+)?;base64,[A-Za-z0-9+/=\s]+$/i;
 
   let sharedSheet = null;
   function getSheet() {
     if (!sharedSheet) {
       sharedSheet = new CSSStyleSheet();
-      sharedSheet.replaceSync(GPV.styles.css);
+      sharedSheet.replaceSync(VX.styles.css);
     }
     return sharedSheet;
   }
@@ -40,12 +42,23 @@ GPV.ui = (() => {
   }
 
   function replaceElement(original, host) {
-    original.setAttribute("data-gpv-handled", "1");
+    original.setAttribute("data-vx-handled", "1");
     original.style.display = "none";
     original.insertAdjacentElement("afterend", host);
   }
 
-  // ── 1. Encrypted Message Bubble ──────────────────────────────────────────
+  // ── 1. Encrypted Message & Media Bubble (Images, Videos, Voice Notes) ────
+
+  const FAILURE_TEXT = {
+    "no-key": ["", "🔒 Encrypted · No key set for this chat.", "Try again"],
+    locked: ["", "🔒 Encrypted · Unlock the Vault in the VeilX popup.", "Try again"],
+    replay: ["error", "⚠ Blocked: this message was already received (replay).", null],
+    "own-unavailable": ["", "🔒 Sent by you · plaintext not kept on this device.", null],
+    "too-far": ["error", "⚠ Blocked: message out of range for this chat.", null],
+    "unknown-sender": ["error", "⚠ Blocked: message from an unknown sender.", null],
+    malformed: ["error", "⚠ Damaged encrypted message.", null],
+    bad: ["error", "⚠ Could not decrypt: wrong key, other chat, or tampered message.", "Try again"],
+  };
 
   function renderEncrypted(original, blob, decryptFn, autoDecrypt) {
     const { host, shadow } = createHost();
@@ -54,6 +67,23 @@ GPV.ui = (() => {
 
     let revealed = false;
     let busy = false;
+    let collapsed = false;
+
+    function setCollapsed(nextCollapsed) {
+      collapsed = Boolean(nextCollapsed);
+      host.hidden = collapsed;
+      host.style.display = collapsed ? "none" : "";
+      if (collapsed) {
+        host.setAttribute("data-vx-collapsed-chunk", "1");
+      } else {
+        host.removeAttribute("data-vx-collapsed-chunk");
+      }
+      const parent = original && original.parentElement;
+      if (parent && parent.children && parent.children.length <= 2) {
+        if (collapsed) parent.setAttribute("data-vx-collapsed-chunk", "1");
+        else parent.removeAttribute("data-vx-collapsed-chunk");
+      }
+    }
 
     function show(statusClass, statusText, buttonLabel) {
       bubble.replaceChildren();
@@ -68,41 +98,135 @@ GPV.ui = (() => {
 
     function showRevealed(plaintext, meta = {}) {
       revealed = true;
+      setCollapsed(false);
       bubble.replaceChildren();
       const statusRow = make("div", "status ok", "🔓 VeilX");
-      if (meta.quantumSafe) {
-        statusRow.appendChild(make("span", "pq-pill", "ML-KEM-768"));
-      }
-      if (meta.chunkLabel) {
-        statusRow.appendChild(make("span", "pq-pill", meta.chunkLabel));
-      }
+      if (meta.badge) statusRow.appendChild(make("span", "pq-pill", meta.badge));
+      if (meta.chunkLabel) statusRow.appendChild(make("span", "pq-pill", meta.chunkLabel));
       bubble.appendChild(statusRow);
       bubble.appendChild(make("div", "plain", plaintext));
     }
+
+    function showProgress(progressText, meta = {}) {
+      setCollapsed(false);
+      bubble.replaceChildren();
+      const statusRow = make("div", "status ok", "🔓 VeilX Media");
+      if (meta.badge) statusRow.appendChild(make("span", "pq-pill", meta.badge));
+      bubble.appendChild(statusRow);
+      const pill = make("div", "vx-progress-pill");
+      pill.appendChild(make("div", "vx-progress-label", progressText));
+      const track = make("div", "vx-progress-track");
+      const fill = make("div", "vx-progress-fill");
+      const pct = Number.isFinite(meta.percent) ? Math.max(8, Math.min(100, Math.round(meta.percent))) : 60;
+      fill.style.width = `${pct}%`;
+      track.appendChild(fill);
+      pill.appendChild(track);
+      bubble.appendChild(pill);
+    }
+
+    function showMedia(dataUrl, meta = {}) {
+      const cleanUrl = String(dataUrl || "").trim();
+      const m = SAFE_MEDIA_DATA_URL_RE.exec(cleanUrl);
+      if (!m) {
+        show("error", "⚠ Invalid or unsupported encrypted media format.", null);
+        return;
+      }
+      const fullMime = m[1].toLowerCase();
+      const isVideo = fullMime.startsWith("video/");
+      const isAudio = fullMime.startsWith("audio/");
+
+      revealed = true;
+      setCollapsed(false);
+      bubble.replaceChildren();
+
+      const headerLabel = isVideo
+        ? "🎬 VeilX Video"
+        : isAudio
+        ? "🎙 VeilX Voice Note"
+        : "🔓 VeilX Image";
+      const statusRow = make("div", "status ok", headerLabel);
+      if (meta.badge) statusRow.appendChild(make("span", "pq-pill", meta.badge));
+      if (meta.chunkLabel) statusRow.appendChild(make("span", "pq-pill", meta.chunkLabel));
+      bubble.appendChild(statusRow);
+
+      if (isVideo) {
+        const wrap = make("div", "vx-video-wrap");
+        const video = document.createElement("video");
+        video.className = "vx-video";
+        video.controls = true;
+        video.playsInline = true;
+        video.preload = "metadata";
+        video.src = cleanUrl;
+        wrap.appendChild(video);
+        bubble.appendChild(wrap);
+      } else if (isAudio) {
+        const wrap = make("div", "vx-audio-wrap");
+        const audio = document.createElement("audio");
+        audio.className = "vx-audio";
+        audio.controls = true;
+        audio.preload = "metadata";
+        audio.src = cleanUrl;
+        wrap.appendChild(audio);
+        bubble.appendChild(wrap);
+      } else {
+        const wrap = make("div", "vx-img-wrap");
+        const img = document.createElement("img");
+        img.className = "vx-img";
+        img.alt = "Decrypted VeilX image";
+        img.src = cleanUrl;
+        img.title = "Click to toggle full-resolution zoom";
+        img.addEventListener("click", () => wrap.classList.toggle("expanded"));
+        wrap.appendChild(img);
+        bubble.appendChild(wrap);
+      }
+
+      const actions = make("div", "vx-img-actions");
+      const subType = fullMime.split("/")[1] || "bin";
+      const extMap = { jpeg: "jpg", quicktime: "mov", mpeg: "mp3", "x-m4a": "m4a" };
+      const ext = extMap[subType] || subType;
+      const dlLabel = isVideo ? "⬇ Save Video" : isAudio ? "⬇ Save Voice" : "⬇ Save Original";
+      const dl = make("a", "vx-img-dl", dlLabel);
+      dl.href = cleanUrl;
+      dl.download = `veilx-encrypted-${isVideo ? "video" : isAudio ? "voice" : "image"}.${ext}`;
+      actions.appendChild(dl);
+
+      const commaIdx = cleanUrl.indexOf(",");
+      const b64Len = commaIdx >= 0 ? cleanUrl.length - commaIdx - 1 : cleanUrl.length;
+      const kb = Math.max(0.1, Math.round(((b64Len * 3) / 4 / 1024) * 10) / 10);
+      const sizeStr = kb >= 1024 ? `${(kb / 1024).toFixed(2)} MB` : `${kb} KB`;
+      actions.appendChild(make("span", "vx-img-meta", sizeStr));
+      bubble.appendChild(actions);
+    }
+
+    const controller = {
+      isConnected: () => host.isConnected,
+      isRevealed: () => revealed,
+      isCollapsed: () => collapsed,
+      setCollapsed,
+      showProgress,
+      showMedia,
+      showImage: showMedia,
+      showRevealed,
+      retry: () => attempt(),
+    };
 
     async function attempt() {
       if (revealed || busy) return;
       busy = true;
       show("", "Decrypting…");
       try {
-        const result = await decryptFn(blob);
+        const result = await decryptFn(blob, controller);
         if (result.ok) {
-          showRevealed(result.text, {
-            quantumSafe: result.quantumSafe,
-            chunkLabel: result.chunkLabel,
-          });
-        } else if (result.reason === "no-key") {
-          show("", "🔒 Encrypted · No key set for this chat.", "Try again");
-        } else if (result.reason === "vault-locked") {
-          show("", "🔒 Encrypted · Unlock Vault in VeilX popup.", "Try again");
-        } else if (result.reason === "replay") {
-          show("error", "⚠ Blocked duplicate / replayed ciphertext.", null);
+          if (result.handledByGroup) {
+            revealed = true;
+          } else if (result.isImage || result.isMedia) {
+            showMedia(result.text, { badge: result.badge, chunkLabel: result.chunkLabel });
+          } else {
+            showRevealed(result.text, { badge: result.badge, chunkLabel: result.chunkLabel });
+          }
         } else {
-          show(
-            "error",
-            "⚠ Could not decrypt: wrong key or damaged message.",
-            "Try again"
-          );
+          const f = FAILURE_TEXT[result.reason] || FAILURE_TEXT.bad;
+          show(f[0], f[1], f[2]);
         }
       } catch (err) {
         console.error("[VeilX] decrypt error:", err);
@@ -116,204 +240,63 @@ GPV.ui = (() => {
     replaceElement(original, host);
     if (autoDecrypt) attempt();
 
-    return {
-      isConnected: () => host.isConnected,
-      isRevealed: () => revealed,
-      retry: () => attempt(),
-    };
+    return controller;
   }
 
   // ── 2. Key-Exchange Message Label ────────────────────────────────────────
 
-  function renderKeyLabel(original, isOwn, isQuantumSafe = true, hasKemCapsule = false) {
+  function renderKeyLabel(original, partLabel) {
     const { host, shadow } = createHost();
     const bubble = make("div", "bubble");
-    const labelText = isOwn
-      ? hasKemCapsule
-        ? "🔑 Your ML-KEM-768 Capsule (sent)"
-        : "🔑 Your ML-KEM-768 Key (sent)"
-      : hasKemCapsule
-      ? "🔑 Contact's ML-KEM-768 Capsule"
-      : "🔑 Contact's ML-KEM-768 Key";
-    const statusRow = make("div", "status ok", labelText);
-    if (isQuantumSafe) {
-      statusRow.appendChild(
-        make("span", "pq-pill", hasKemCapsule ? "KEM-768" : "FIPS-203")
-      );
-    }
+    const statusRow = make("div", "status ok", "🔑 VeilX key exchange message" + (partLabel ? ` (${partLabel})` : ""));
+    statusRow.appendChild(make("span", "pq-pill", "ML-KEM-768 + P-256"));
     bubble.appendChild(statusRow);
     shadow.appendChild(bubble);
     replaceElement(original, host);
   }
 
-  // ── 3. VeilX Cross-Origin Extension Iframe Composer (Zero postMessage) ───
+  // ── 3. VeilX Cross-Origin Extension Iframe Composer ──────────────────────
 
-  function renderComposer(anchorEl, handlers) {
+  function renderComposer(anchorEl) {
     const { host, shadow } = createHost("div", COMPOSER_HOST_ATTRIBUTE);
 
     const SHIELDED_EVENTS = [
-      "keydown",
-      "keyup",
-      "keypress",
-      "beforeinput",
-      "input",
-      "compositionstart",
-      "compositionupdate",
-      "compositionend",
-      "paste",
-      "copy",
-      "cut",
+      "keydown", "keyup", "keypress", "beforeinput", "input",
+      "compositionstart", "compositionupdate", "compositionend", "paste", "copy", "cut",
     ];
     for (const evtName of SHIELDED_EVENTS) {
       window.addEventListener(
         evtName,
-        (e) => {
-          if (e.target === host) {
-            e.stopImmediatePropagation();
-          }
-        },
+        (e) => { if (e.target === host) e.stopImmediatePropagation(); },
         true
       );
     }
 
-    const canUseExtensionIframe = Boolean(
-      typeof chrome !== "undefined" &&
-        chrome.runtime &&
-        typeof chrome.runtime.getURL === "function"
-    );
-
-    let iframeEl = null;
-    if (canUseExtensionIframe) {
-      const wrap = make("div", "vx-iframe-wrap");
-      iframeEl = document.createElement("iframe");
-      iframeEl.className = "vx-composer-iframe";
-      const tid = GPV.dom.getThreadId() || "";
-      iframeEl.src =
-        chrome.runtime.getURL("composer/composer.html") +
-        `?threadId=${encodeURIComponent(tid)}`;
-      iframeEl.setAttribute("title", "VeilX Secure Composer");
-      iframeEl.setAttribute("allow", "clipboard-read; clipboard-write");
-      wrap.appendChild(iframeEl);
-      shadow.appendChild(wrap);
-    }
-
-    // Minimalist single-line fallback pill for synthetic test environments without iframes
-    const shell = make("div", "vx-composer-shell");
-    if (canUseExtensionIframe) shell.hidden = true;
-
-    const statusBtn = make("button", "vx-chip-btn", "ML-KEM-768");
-    statusBtn.type = "button";
-
-    const textarea = make("textarea", "vx-textarea");
-    textarea.rows = 1;
-    textarea.placeholder = "Message securely with VeilX…";
-    textarea.autocomplete = "off";
-    textarea.spellcheck = false;
-
-    const counter = make("span", "vx-counter", "0 B");
-    const sendBtn = make("button", "vx-send-btn", "Send");
-    sendBtn.type = "button";
-
-    shell.append(statusBtn, textarea, counter, sendBtn);
-    shadow.appendChild(shell);
-
-    for (const evtName of SHIELDED_EVENTS) {
-      textarea.addEventListener(
-        evtName,
-        (e) => {
-          e.stopPropagation();
-        },
-        true
-      );
-      shell.addEventListener(
-        evtName,
-        (e) => {
-          e.stopPropagation();
-        },
-        false
-      );
-    }
-
-    function updateCounter() {
-      const bytes = GPV.util.utf8ByteLength(textarea.value);
-      counter.textContent = `${bytes} B`;
-    }
-
-    textarea.addEventListener("input", updateCounter);
-
-    let busy = false;
-    async function triggerSend() {
-      if (busy) return;
-      const text = textarea.value;
-      if (!text.trim()) return;
-      busy = true;
-      sendBtn.disabled = true;
-      try {
-        const ok = await handlers.onSendText(text);
-        if (ok) {
-          textarea.value = "";
-          updateCounter();
-        }
-      } finally {
-        busy = false;
-        sendBtn.disabled = false;
-      }
-    }
-
-    textarea.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
-        e.preventDefault();
-        triggerSend();
-      }
-    });
-
-    sendBtn.addEventListener("click", triggerSend);
-    statusBtn.addEventListener("click", async () => {
-      await handlers.onSendKey();
-    });
+    const wrap = make("div", "vx-iframe-wrap");
+    const iframeEl = document.createElement("iframe");
+    iframeEl.className = "vx-composer-iframe";
+    const srcFor = (tid) => chrome.runtime.getURL("composer/composer.html") + `?threadId=${encodeURIComponent(tid || "")}`;
+    iframeEl.src = srcFor(VX.dom.getThreadId());
+    iframeEl.setAttribute("title", "VeilX Secure Composer");
+    iframeEl.setAttribute("allow", "microphone");
+    wrap.appendChild(iframeEl);
+    shadow.appendChild(wrap);
 
     anchorEl.insertAdjacentElement("afterend", host);
 
-    function updateState({ enabled, record, threadId, requireVerification }) {
-      if (iframeEl && threadId) {
-        const expectedSrc =
-          chrome.runtime.getURL("composer/composer.html") +
-          `?threadId=${encodeURIComponent(threadId)}`;
-        if (iframeEl.src !== expectedSrc) {
-          iframeEl.src = expectedSrc;
-        }
+    function updateState({ enabled, threadId }) {
+      if (threadId) {
+        const expected = srcFor(threadId);
+        if (iframeEl.src !== expected) iframeEl.src = expected;
       }
-
-      if (!enabled) {
-        host.hidden = true;
-        return;
-      }
-      host.hidden = false;
-
-      let nextLabel = "Exchange Key";
-      if (record && record.keyB64) {
-        if (record.mode === "ecdh" && requireVerification && !record.verified) {
-          nextLabel = "Verify Key";
-        } else {
-          nextLabel =
-            record.mode === "passphrase" ? "AES-256 Key" : "ML-KEM-768";
-        }
-      }
-      if (statusBtn.textContent !== nextLabel) {
-        statusBtn.textContent = nextLabel;
-      }
+      host.hidden = !enabled;
     }
 
     return {
       host,
       isConnected: () => host.isConnected,
+      isMounted: () => host.isConnected && Boolean(iframeEl.isConnected),
       updateState,
-      getValue: () => textarea.value,
-      setValue: (v) => {
-        textarea.value = v;
-        updateCounter();
-      },
-      focus: () => textarea.focus(),
       remove: () => host.remove(),
     };
   }
@@ -381,4 +364,4 @@ GPV.ui = (() => {
   };
 })();
 
-if (typeof module !== "undefined") module.exports = GPV.ui;
+if (typeof module !== "undefined") module.exports = VX.ui;

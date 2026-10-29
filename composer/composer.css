@@ -1,22 +1,21 @@
 /*
-  composer/composer.css — Purplish-Bluish Instagram-Inspired Theme for VeilX v5.0.
-  Uses a deep midnight indigo-slate pill (`#0f111c`) with an Electric Indigo ->
-  Cosmic Violet -> Royal Blue gradient (`#6366f1` -> `#8b5cf6` -> `#3b82f6`),
-  blending naturally into Instagram Direct while unmistakably signaling VeilX protection.
+  composer/composer.css — Obsidian Midnight Black & Titanium Theme for VeilX Composer.
+  Matches the aesthetic of veilxweb.onrender.com:
+    - Obsidian pill (#08090c -> #0b0d11) with subtle hairline border (rgba(255,255,255,0.11))
+    - Secondary controls in dark slate (#141822 / #1c2230)
+    - Primary Send button in crisp high-contrast White (#ffffff) with Black (#000000) text
 */
 
 :root {
-  --bg-pill:       #0f111c;
-  --bg-surface:    #181b2c;
-  --border-subtle: rgba(139, 92, 246, 0.24);
-  --border-focus:  rgba(139, 92, 246, 0.62);
-  --text-primary:  #f5f6fa;
-  --text-secondary:#c4c6dc;
-  --text-muted:    #7c809b;
-  --accent-indigo: #6366f1;
-  --accent-violet: #8b5cf6;
-  --accent-blue:   #3b82f6;
-  --grad-primary:  linear-gradient(135deg, #6366f1 0%, #8b5cf6 52%, #3b82f6 100%);
+  --bg-pill:       #08090c;
+  --bg-surface:    #141822;
+  --bg-hover:      #1c2230;
+  --border-subtle: rgba(255, 255, 255, 0.11);
+  --border-focus:  rgba(255, 255, 255, 0.34);
+  --text-primary:  #f8fafc;
+  --text-secondary:#e4e4e7;
+  --text-muted:    #71717a;
+  --emerald:       #34d399;
   --amber-warn:    #f59e0b;
 }
 
@@ -30,27 +29,52 @@ html, body {
   width: 100%;
   background: transparent;
   color: var(--text-primary);
-  font: 14px/1.42 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+  font: 14px/1.42 "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
 }
 
 .vx-pill {
+  position: relative;
+  overflow: hidden;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   min-height: 44px;
   padding: 5px 6px 5px 8px;
-  border-radius: 24px;
-  background: var(--bg-pill);
-  border: 1.5px solid var(--border-subtle);
-  box-shadow: 0 4px 20px rgba(10, 12, 24, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  border-radius: 22px;
+  background: linear-gradient(180deg, #11141c 0%, #08090c 100%);
+  border: 1px solid var(--border-subtle);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 8px 24px rgba(0, 0, 0, 0.75);
   transition: border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
-.vx-pill:focus-within {
+.vx-pill:focus-within,
+.vx-pill.drag-over,
+.vx-pill.uploading {
   border-color: var(--border-focus);
-  box-shadow: 0 4px 24px rgba(99, 102, 241, 0.22), 0 0 0 2px rgba(139, 92, 246, 0.12);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 8px 28px rgba(0, 0, 0, 0.85), 0 0 0 2px rgba(255, 255, 255, 0.06);
+}
+
+.vx-progress-wrap {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 2px;
+  height: 3.5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.vx-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #a1a1aa 0%, #ffffff 55%, #34d399 100%);
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.45);
+  transition: width 0.14s ease-out;
 }
 
 .vx-badge-btn {
@@ -59,24 +83,24 @@ html, body {
   gap: 5px;
   height: 30px;
   padding: 0 11px;
-  border-radius: 999px;
-  border: 1px solid rgba(139, 92, 246, 0.32);
-  background: rgba(99, 102, 241, 0.14);
-  color: #c7d2fe;
+  border-radius: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: #e4e4e7;
   font: 600 11.5px inherit;
-  letter-spacing: 0.15px;
+  letter-spacing: 0.1px;
   cursor: pointer;
   flex-shrink: 0;
   transition: all 0.15s ease;
 }
 .vx-badge-btn:hover {
-  background: rgba(99, 102, 241, 0.24);
+  background: rgba(255, 255, 255, 0.12);
   color: #ffffff;
-  border-color: rgba(139, 92, 246, 0.55);
+  border-color: rgba(255, 255, 255, 0.24);
 }
 .vx-badge-btn.needs-action {
-  background: rgba(245, 158, 11, 0.15);
-  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.38);
   color: #fde68a;
 }
 
@@ -95,19 +119,69 @@ html, body {
 .vx-input::placeholder {
   color: var(--text-muted);
 }
+.vx-pill.uploading .vx-input::placeholder {
+  color: #f4f4f5;
+  font-weight: 500;
+}
 .vx-input:focus {
   outline: none;
 }
 
 .vx-counter {
+  font-family: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
   font-size: 11px;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
-  padding: 0 4px;
+  padding: 0 5px;
   flex-shrink: 0;
+  white-space: nowrap;
 }
 .vx-counter.warn {
   color: var(--amber-warn);
+}
+.vx-counter.active-progress {
+  color: #ffffff;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.09);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.vx-voice-btn,
+.vx-img-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 32px;
+  padding: 0 11px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font: 600 11.5px inherit;
+  letter-spacing: 0.1px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+.vx-voice-btn:hover:not(:disabled),
+.vx-img-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.24);
+}
+.vx-voice-btn:disabled,
+.vx-img-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+.vx-voice-btn.recording {
+  background: rgba(239, 68, 68, 0.22);
+  border-color: rgba(248, 113, 113, 0.75);
+  color: #fecaca;
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.35);
 }
 
 .vx-send-btn {
@@ -116,24 +190,24 @@ html, body {
   justify-content: center;
   height: 32px;
   padding: 0 16px;
-  border-radius: 999px;
+  border-radius: 12px;
   border: 0;
-  background: var(--grad-primary);
-  color: #ffffff;
-  font: 600 13px inherit;
+  background: #ffffff;
+  color: #000000;
+  font: 600 12.5px inherit;
   letter-spacing: 0.1px;
   cursor: pointer;
   flex-shrink: 0;
-  box-shadow: 0 2px 10px rgba(99, 102, 241, 0.35);
-  transition: filter 0.15s ease, transform 0.1s ease, opacity 0.15s ease;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  transition: background 0.15s ease, transform 0.1s ease, opacity 0.15s ease;
 }
 .vx-send-btn:hover:not(:disabled) {
-  filter: brightness(1.1);
+  background: #e4e4e7;
 }
 .vx-send-btn:active:not(:disabled) {
   transform: scale(0.97);
 }
 .vx-send-btn:disabled {
-  opacity: 0.4;
+  opacity: 0.38;
   cursor: default;
 }

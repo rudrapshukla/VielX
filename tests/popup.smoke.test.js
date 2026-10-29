@@ -1,212 +1,106 @@
 /**
- * tests/popup.smoke.test.js — opens popup/popup.html in a simulated browser and
- * checks that all buttons, Studio Web App launcher, Safety Code verification,
- * and Master Vault Lock/Unlock work.
+ * tests/popup.smoke.test.js — the real popup.html/popup.js against stubbed extension APIs.
  */
-
+"use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
 const { webcrypto } = require("node:crypto");
 const { JSDOM } = require("./dom_harness.js");
+const { makeParty } = require("./helpers.js");
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const THREAD = "5551234";
 
-async function openPopup(tabUrl, initialStorage = {}) {
-  const data = { ...initialStorage };
-  const changeListeners = [];
-  const sentToTab = [];
-  const createdTabs = [];
-
+async function openPopup(initial = {}, { offerPending = false } = {}) {
+  const data = JSON.parse(JSON.stringify(initial));
+  const sent = [];
+  const clone = (x) => JSON.parse(JSON.stringify(x));
+  const listeners = [];
   const chrome = {
-    runtime: {
-      id: "test-extension",
-      getURL: (rel) => `chrome-extension://test-extension/${rel.replace(/^\//, "")}`,
-    },
+    runtime: { id: "x", sendMessage: async (m) => { sent.push(m); return { ok: true }; } },
     tabs: {
-      query: async () => [{ id: 7, url: tabUrl }],
-      create: async (opts) => {
-        createdTabs.push(opts);
-        return { id: 99, ...opts };
-      },
-      sendMessage: async (id, message) => {
-        sentToTab.push(message);
+      query: async () => [{ id: 3, url: `https://www.instagram.com/direct/t/${THREAD}/` }],
+      sendMessage: async (id, m) => {
+        sent.push(m);
+        if (m.type === "VX_QUERY") return { ok: true, threadId: THREAD, offer: offerPending ? { replaces: false } : null };
         return { ok: true };
       },
     },
     storage: {
-      onChanged: { addListener: (fn) => changeListeners.push(fn) },
+      onChanged: { addListener: (fn) => listeners.push(fn) },
       local: {
-        async get(keys) {
-          if (keys === null) return JSON.parse(JSON.stringify(data));
-          const out = {};
-          for (const key of Array.isArray(keys) ? keys : [keys]) {
-            if (key in data) out[key] = JSON.parse(JSON.stringify(data[key]));
-          }
-          return out;
-        },
-        async set(values) {
-          Object.assign(data, JSON.parse(JSON.stringify(values)));
-          changeListeners.forEach((fn) => fn({}, "local"));
-        },
-        async remove(key) {
-          delete data[key];
-          changeListeners.forEach((fn) => fn({}, "local"));
-        },
+        async get(k) { if (k === null) return clone(data); const o = {}; for (const x of Array.isArray(k) ? k : [k]) if (x in data) o[x] = clone(data[x]); return o; },
+        async set(v) { const ch = {}; for (const [k, x] of Object.entries(v)) { ch[k] = { oldValue: data[k], newValue: x }; data[k] = clone(x); } listeners.forEach((f) => f(ch)); },
+        async remove(k) { for (const x of Array.isArray(k) ? k : [k]) delete data[x]; },
       },
     },
   };
-
   const dom = await JSDOM.fromFile(path.join(__dirname, "..", "popup", "popup.html"), {
-    runScripts: "dangerously",
-    resources: "usable",
-    pretendToBeVisual: true,
-    beforeParse(window) {
-      window.chrome = chrome;
-      Object.defineProperty(window, "crypto", { value: webcrypto, configurable: true });
-      window.TextEncoder = TextEncoder;
-      window.TextDecoder = TextDecoder;
+    url: "chrome-extension://x/popup/popup.html",
+    beforeParse(w) {
+      w.chrome = chrome;
+      Object.defineProperty(w, "crypto", { value: webcrypto, configurable: true });
+      w.TextEncoder = TextEncoder; w.TextDecoder = TextDecoder;
     },
   });
-
-  await sleep(150);
-
+  await sleep(400);
   const $ = (id) => dom.window.document.getElementById(id);
-  return { dom, data, sentToTab, createdTabs, $ };
+  return { $, data, sent, window: dom.window };
 }
 
-test("no chat open: shows 'No conversation open' card, has no popup message box, and launches VeilX Studio Web App", async () => {
-  const p = await openPopup("https://www.instagram.com/");
-  assert.equal(p.$("noChatCard").hidden, false);
-  assert.equal(p.$("chatCard").hidden, true);
-  assert.equal(p.$("setupCard").hidden, true);
-  assert.equal(p.$("composeInput"), null, "Send message box was removed from popup as requested");
-  assert.match(p.$("statusText").textContent, /on/);
+async function pair() {
+  const A = makeParty(), B = makeParty();
+  const offer = await A.session.createOffer(THREAD);
+  const [entry] = B.protocol.reassembleKeyPackets(offer.packets);
+  const [ev] = await B.session.processKeyEntries(THREAD, [entry]);
+  const reply = await B.session.acceptOffer(THREAD, ev.entry);
+  await A.session.processKeyEntries(THREAD, A.protocol.reassembleKeyPackets([...offer.packets, ...reply.packets]));
+  return A.data;
+}
 
-  p.$("openStudioBtn").click();
-  await sleep(50);
-  assert.equal(p.createdTabs.length, 1);
-  assert.equal(p.createdTabs[0].url, "chrome-extension://test-extension/app/app.html");
+test("no key yet: setup card is shown and 'start exchange' asks the page to post an offer", async () => {
+  const p = await openPopup();
+  assert.equal($(p).setupCard.hidden, false);
+  $(p).startKexBtn.click();
+  await sleep(150);
+  assert.ok(p.sent.some((m) => m.type === "VX_START_EXCHANGE"));
 });
 
-test("chat without a key: shows setup; Generate fills a strong passphrase", async () => {
-  const p = await openPopup("https://www.instagram.com/direct/t/1234567890/");
-  assert.equal(p.$("setupCard").hidden, false);
-  assert.match(p.$("chatState").textContent, /No key yet/);
-  assert.equal(p.$("chatId").textContent, "…567890");
-
-  p.$("genBtn").click();
-  assert.match(p.$("passInput").value, /^[A-HJ-NP-Z2-9]{5}(-[A-HJ-NP-Z2-9]{5}){3}$/);
+test("a pending offer from the contact turns the button into 'Accept'", async () => {
+  const p = await openPopup({}, { offerPending: true });
+  assert.match(p.$("chatState").textContent, /sent a key-exchange offer/);
+  assert.match(p.$("sendKeyBtn").textContent, /Accept/);
+  p.$("sendKeyBtn").click();
+  await sleep(150);
+  assert.ok(p.sent.some((m) => m.type === "VX_ACCEPT_OFFER"));
 });
 
-test("a short passphrase is rejected and nothing is saved", async () => {
-  const p = await openPopup("https://www.instagram.com/direct/t/1234567890/");
-  p.$("passInput").value = "short";
+test("established but unverified: shows the 128-bit safety code, blocks sending, verify unlocks", async () => {
+  const data = await pair();
+  const p = await openPopup(data);
+  assert.equal(p.$("safetyBox").hidden, false);
+  assert.match(p.$("safetyCode").textContent, /^([0-9A-F]{4} ){7}[0-9A-F]{4}$/);
+  assert.match(p.$("chatState").textContent, /Pending verification/);
+  assert.equal(p.$("verifyBtn").hidden, false);
+  p.$("verifyBtn").click();
+  await sleep(200);
+  assert.equal(p.data[`conv:${THREAD}`].verified, true);
+  assert.match(p.$("chatState").textContent, /forward secrecy/);
+});
+
+test("passphrase: self-chosen phrases are refused, generated ones are accepted", async () => {
+  const p = await openPopup();
+  p.$("passInput").value = "my favourite long phrase";
   p.$("savePassBtn").click();
-  await sleep(100);
-  assert.match(p.$("message").textContent, /at least 12/);
-  assert.equal(p.data["conv:1234567890"], undefined);
-});
-
-test("saving a passphrase stores a key (never the passphrase) and shows Ready", async () => {
-  const p = await openPopup("https://www.instagram.com/direct/t/1234567890/");
-  p.$("passInput").value = "my shared passphrase";
+  await sleep(200);
+  assert.match(p.$("message").textContent, /generated by VeilX|Generate/);
+  assert.equal(p.data[`conv:${THREAD}`], undefined);
+  p.$("genBtn").click();
   p.$("savePassBtn").click();
   await sleep(1500);
-
-  const record = p.data["conv:1234567890"];
-  assert.equal(record.mode, "passphrase");
-  assert.ok(record.keyB64);
-  assert.ok(!JSON.stringify(p.data).includes("my shared passphrase"));
-  assert.match(p.$("chatState").textContent, /Ready/);
-  assert.equal(p.$("passInput").value, "");
-  assert.equal(p.$("removeBtn").hidden, false);
+  assert.equal(p.data[`conv:${THREAD}`].mode, "passphrase");
+  assert.match(p.$("chatState").textContent, /NO forward secrecy/);
 });
 
-test("Remove key needs two clicks", async () => {
-  const p = await openPopup("https://www.instagram.com/direct/t/1234567890/", {
-    "conv:1234567890": { mode: "passphrase", keyB64: "AAAA", verified: true },
-  });
-  p.$("removeBtn").click();
-  await sleep(50);
-  assert.ok(p.data["conv:1234567890"], "first click only arms the button");
-  assert.match(p.$("removeBtn").textContent, /again/);
-
-  p.$("removeBtn").click();
-  await sleep(100);
-  assert.equal(p.data["conv:1234567890"], undefined);
-  assert.equal(p.$("setupCard").hidden, false);
-});
-
-test("Key exchange tab: the button asks the page to send our key", async () => {
-  const p = await openPopup("https://www.instagram.com/direct/t/1234567890/");
-  p.$("tabKex").click();
-  assert.equal(p.$("panelKex").hidden, false);
-  assert.equal(p.$("panelPass").hidden, true);
-
-  p.$("startKexBtn").click();
-  await sleep(100);
-  assert.equal(p.sentToTab.length, 1);
-  assert.equal(p.sentToTab[0].type, "GPV_SEND_KEY");
-});
-
-test("a finished ML-KEM-768 key exchange shows the safety code and Verify safety code button", async () => {
-  const GPVCrypto = require("../src/crypto.js");
-  const me = await GPVCrypto.generateIdentity();
-  const them = await GPVCrypto.generateIdentity();
-  const p = await openPopup("https://www.instagram.com/direct/t/1234567890/", {
-    identity: me,
-    "conv:1234567890": {
-      mode: "ecdh",
-      keyB64: "AAAA",
-      peerPub: them.publicKey,
-      sentMyKey: true,
-      pqSharedB64: "BBBB",
-      quantumSafe: true,
-      verified: false,
-    },
-  });
-  assert.equal(p.$("safetyBox").hidden, false);
-  assert.equal(p.$("verifyBtn").hidden, false);
-
-  p.$("verifyBtn").click();
-  await sleep(150);
-  assert.equal(p.data["conv:1234567890"].verified, true);
-  assert.equal(p.$("verifyBtn").hidden, true);
-});
-
-test("Master Vault Lock encrypts keys in storage and Unlock restores them", async () => {
-  const p = await openPopup("https://www.instagram.com/direct/t/1234567890/", {
-    "conv:1234567890": { mode: "passphrase", keyB64: "SECRET_KEY_B64", verified: true },
-  });
-  assert.equal(p.$("vaultBadge").textContent, "Unlocked");
-
-  p.$("vaultPassInput").value = "my-master-vault-passphrase-123";
-  p.$("lockVaultBtn").click();
-  await sleep(1800);
-
-  assert.equal(p.data["conv:1234567890"], undefined, "Plaintext key wiped from storage");
-  assert.ok(p.data.vaultEnvelope, "Encrypted vaultEnvelope stored");
-  assert.equal(p.data.vaultLocked, true);
-  assert.equal(p.$("vaultBadge").textContent, "Locked");
-
-  p.$("vaultPassInput").value = "my-master-vault-passphrase-123";
-  p.$("unlockVaultBtn").click();
-  await sleep(1800);
-
-  assert.equal(p.data.vaultLocked, false);
-  assert.equal(p.data["conv:1234567890"].keyB64, "SECRET_KEY_B64", "Key restored after unlock");
-  assert.equal(p.$("vaultBadge").textContent, "Unlocked");
-});
-
-test("master toggle and Purplish-Bluish UI toggle save settings", async () => {
-  const p = await openPopup("https://www.instagram.com/");
-  p.$("masterToggle").click();
-  await sleep(100);
-  assert.equal(p.data.enabled, false);
-  assert.match(p.$("statusText").textContent, /off/);
-
-  p.$("beautifyToggle").click();
-  await sleep(100);
-  assert.equal(p.data.beautifyUi, false);
-});
+function $(p) { return new Proxy({}, { get: (_, id) => p.$(id) }); }

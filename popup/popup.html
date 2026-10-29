@@ -1,11 +1,9 @@
 <!DOCTYPE html>
 <!--
-  popup/popup.html — VeilX v5.0 Control Center & Studio Launcher.
-  - All settings and key setup live cleanly here (no cluttered drawers in the chat box).
-  - Removed the duplicate "send message" box from the popup (messages are sent directly
-    from the sleek on-page VeilX pill or the VeilX Studio Web App).
+  popup/popup.html — VeilX Obsidian Black Control Center & Web Messenger Link.
+  Matches the Midnight Black & Titanium aesthetic of veilxweb.onrender.com.
 -->
-<html lang="en">
+<html lang="en" class="dark">
 <head>
   <meta charset="UTF-8" />
   <title>VeilX</title>
@@ -15,10 +13,15 @@
 
   <header class="header">
     <div class="brand-wrap">
-      <div class="brand-icon">V</div>
-      <div>
+      <div class="brand-icon" aria-hidden="true">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"></path>
+          <path d="M9 12l2 2 4-4"></path>
+        </svg>
+      </div>
+      <div class="brand-title-row">
         <h1 class="title">VeilX</h1>
-        <span class="pq-badge">ML-KEM-768 + P-256</span>
+        <span class="pq-badge">POST-QUANTUM</span>
       </div>
     </div>
     <label class="switch" title="Turn encryption on or off">
@@ -35,13 +38,20 @@
         <span class="dot" id="statusDot"></span>
         <span id="statusText">Loading…</span>
       </p>
-      <button type="button" class="btn btn-studio" id="openStudioBtn">Open VeilX Studio ↗</button>
+      <a
+        href="https://veilxweb.onrender.com"
+        target="_blank"
+        rel="noopener"
+        class="btn btn-studio"
+        id="openStudioBtn"
+        title="Open VeilX Web Messenger (https://veilxweb.onrender.com)"
+      >veilxweb.onrender.com ↗</a>
     </div>
 
     <!-- Shown when no chat is open -->
     <section class="card" id="noChatCard" hidden>
       <h2 class="card-title">No conversation open</h2>
-      <p class="card-text">Open a conversation in Instagram Direct (the address contains <code>/direct/t/</code>) or launch <strong>VeilX Studio</strong> above to manage keys and send encrypted messages directly in the chat bar.</p>
+      <p class="card-text">Open a conversation in Instagram Direct (the address contains <code>/direct/t/</code>) or visit <a href="https://veilxweb.onrender.com" target="_blank" rel="noopener" class="inline-link">veilxweb.onrender.com</a> above to launch the standalone VeilX Web Messenger.</p>
     </section>
 
     <!-- Shown when a chat is open -->
@@ -50,7 +60,7 @@
       <p class="card-text" id="chatState"></p>
 
       <div class="safety" id="safetyBox" hidden>
-        <span class="safety-label">80-bit Safety Code</span>
+        <span class="safety-label">128-bit Safety Code</span>
         <code class="safety-code" id="safetyCode"></code>
         <p class="hint" id="safetyHint">Compare this code with your contact by voice or in person to verify no one tampered with your public keys.</p>
       </div>
@@ -72,23 +82,23 @@
       </div>
 
       <div id="panelPass" role="tabpanel" aria-labelledby="tabPass">
-        <p class="card-text">Both of you enter the same passphrase. Stretched with 600,000 PBKDF2-SHA256 iterations into a 256-bit AES-GCM key.</p>
+        <p class="card-text">Both of you enter the same VeilX-generated 100-bit passphrase (stretched with 600,000 PBKDF2-SHA256 iterations). No forward secrecy: prefer a key exchange.</p>
         <label class="field-label" for="passInput">Passphrase</label>
-        <input type="password" id="passInput" class="field mono" autocomplete="new-password" spellcheck="false" placeholder="At least 12 characters" />
+        <input type="password" id="passInput" class="field mono" autocomplete="new-password" spellcheck="false" placeholder="Press Generate (e.g. ABCDE-FGHJK-LMNPQ-RSTUV)" />
         <div class="row">
           <button type="button" class="btn" id="genBtn">Generate</button>
           <button type="button" class="btn" id="copyBtn">Copy</button>
           <button type="button" class="btn btn-primary" id="savePassBtn">Save key</button>
         </div>
-        <p class="hint">Copy it before saving. VeilX keeps only the derived key, never the passphrase.</p>
+        <p class="hint">Copy it before saving. VeilX keeps only the derived key, never the passphrase text.</p>
       </div>
 
       <div id="panelKex" role="tabpanel" aria-labelledby="tabKex" hidden>
-        <p class="card-text">Standardized <strong>NIST FIPS 203 ML-KEM-768</strong> + <strong>ECDH P-256</strong> hybrid key exchange. No passphrase needed.</p>
+        <p class="card-text">Hybrid <strong>ML-KEM-768</strong> (FIPS 203) + <strong>ephemeral ECDH P-256</strong> key exchange with forward secrecy. Fresh keys every time; no passphrase needed.</p>
         <div class="row">
           <button type="button" class="btn btn-primary" id="startKexBtn">Send my key</button>
         </div>
-        <p class="hint">After the exchange, you can compare the 80-bit safety code with your contact.</p>
+        <p class="hint">After the exchange, you can compare the 128-bit safety code with your contact.</p>
       </div>
     </section>
 
@@ -106,6 +116,19 @@
       </div>
     </section>
 
+    <!-- Zero-Knowledge Cloudflare Media Relay -->
+    <section class="card" id="relayCard">
+      <div class="vault-head">
+        <h2 class="card-title">Zero-Knowledge Media Relay</h2>
+        <span class="vault-pill">1-DM Media</span>
+      </div>
+      <p class="card-text">Encrypts original-quality photos, short videos &amp; voice notes (up to 15 MB) with AES-256-GCM before uploading to your relay and sends 1 DM pointer.</p>
+      <input type="text" id="relayUrlInput" class="field mono" autocomplete="off" spellcheck="false" placeholder="https://veilx-relay.therealrudrashukla.workers.dev" />
+      <div class="row">
+        <button type="button" class="btn btn-primary" id="saveRelayBtn">Save Relay URL</button>
+      </div>
+    </section>
+
     <p class="message" id="message" role="status" hidden></p>
 
     <section class="card settings-card">
@@ -115,7 +138,7 @@
       </label>
       <label class="check">
         <input type="checkbox" id="beautifyToggle" />
-        <span>Purplish-Bluish Instagram UI Theme</span>
+        <span>Obsidian Black VeilX UI Theme</span>
       </label>
       <label class="check">
         <input type="checkbox" id="padToggle" />
@@ -130,16 +153,19 @@
   </main>
 
   <footer class="footer">
-    <span>Created by Team Monolith</span>
+    <span>Rudra Pratap Shukla &bull; Monolith</span>
     <span class="links">
+      <a href="https://veilxweb.onrender.com" target="_blank" rel="noopener">Web App</a>
       <a href="https://github.com/rudrapshukla" target="_blank" rel="noopener">GitHub</a>
       <a href="mailto:rudrapshukla@proton.me">Email</a>
     </span>
   </footer>
 
   <script src="../src/crypto.js"></script>
+  <script src="../src/protocol.js"></script>
   <script src="../src/util.js"></script>
   <script src="../src/store.js"></script>
+  <script src="../src/session.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -1,446 +1,72 @@
 /**
- * src/content.js — VeilX v5.2.0 Content Script Conductor.
+ * src/content.js — VeilX 1.0.0 page script (runs on instagram.com).
  *
- * VeilX v5.2.0 · NIST FIPS 203 ML-KEM-768 + ECDH P-256 · Created by Team Monolith
- * Source: https://github.com/rudrapshukla/guptavarta   License: MIT
+ * Responsibilities: find VeilX messages in the chat, decrypt/render them
+ * (including Zero-Knowledge Relay 1-DM original-fidelity images, short videos,
+ * voice notes, and multi-chunk fallback images), run the key-exchange state
+ * machine via VX.session, and relay ciphertext (never plaintext) from the
+ * extension-origin composer into Instagram's send box.
+ *
+ * Fail-closed: if the VeilX composer is not mounted, or if someone types into
+ * Instagram's own message box, nothing is encrypted-from-or-sent-through that
+ * box — the attempt is blocked and the user is told why.
  */
 
 (function () {
   "use strict";
 
-  const gpvCrypto = GPV.crypto;
-  const { store, dom, ui, util } = GPV;
+  const P = VX.protocol;
+  const C = VX.crypto;
+  const { store, dom, ui, util, session } = VX;
 
-  const MSG_PREFIX = gpvCrypto.MSG_PREFIX; // "GPV2:"
-  const KEY_PREFIX = gpvCrypto.KEY_PREFIX; // "GPV2K:"
-  const MAX_DECRYPTS_PER_SCAN = 40;
+  const MAX_DECRYPTS_PER_SCAN = 120;
+  const ALLOWED_SIDECAR_MIME_RE =
+    /^(image\/(webp|png|jpeg|jpg|gif)|video\/(mp4|webm|quicktime)|audio\/(webm|ogg|mp4|mpeg|mp3|wav|x-m4a))$/i;
 
   let settings = {
-    enabled: true,
-    autoDecrypt: true,
-    beautifyUi: true,
-    padMessages: true,
-    requireVerification: false,
+    enabled: true, autoDecrypt: true, beautifyUi: true, padMessages: true, requireVerification: true,
   };
 
   let sending = false;
-  const keyCache = new Map();
-  const pendingBubbles = new Set();
-  const warnedKeyChanges = new Set();
-
-  // Map token -> DOM element currently displaying that token.
-  const activeTokenElements = new Map(); // token -> { el, scanId }
-  let currentScanPassId = 0;
-
   let activeComposer = null;
   let activeAnchorInput = null;
   let lastThreadId = null;
+  const pendingBubbles = new Set();
+  const incomingOffers = new Map(); // threadId -> { entry, replaces }
+  const imageGroups = new Map();    // "${threadId}:${gid}" -> { ct, badge, parts: Map<ci, string>, controllers: Map<ci, controller> }
+  const sidecarCache = new Map();   // blobUrl -> decrypted Data URL (prevents re-downloading on virtual scroller re-renders)
 
-  // ── Keys & Smart Replay-Protected Decryption ─────────────────────────────
-
-  async function buildCandidateKeys(record) {
-    const keys = [];
-    const seenB64 = new Set();
-
-    async function addKeyB64(b64) {
-      if (!b64 || seenB64.has(b64)) return;
-      seenB64.add(b64);
-      try {
-        const rawBytes = gpvCrypto.base64ToBytes(b64);
-        if (rawBytes.length === 32) {
-          const aesKey = await gpvCrypto.importAesKey(rawBytes);
-          keys.push({ aesKey, rawBytes, keyB64: b64 });
-        }
-      } catch (_) {}
-    }
-
-    if (record && record.keyB64) {
-      await addKeyB64(record.keyB64);
-    }
-    if (record && Array.isArray(record.altKeysB64)) {
-      for (const altB64 of record.altKeysB64) {
-        await addKeyB64(altB64);
-      }
-    }
-
-    if (record && record.mode === "ecdh" && record.peerPub) {
-      try {
-        const identity = await store.getIdentity();
-        if (identity && identity.privateJwk && identity.publicKey) {
-          const pqSecrets = [
-            record.decapsulatedPqB64,
-            record.myPqSecretB64,
-            record.pqSharedB64,
-          ].filter(Boolean);
-          for (const pqB64 of pqSecrets) {
-            try {
-              const derivedBytes = await gpvCrypto.deriveSharedKey(
-                identity.privateJwk,
-                identity.publicKey,
-                record.peerPub,
-                gpvCrypto.base64ToBytes(pqB64)
-              );
-              await addKeyB64(gpvCrypto.bytesToBase64(derivedBytes));
-            } catch (_) {}
-          }
-        }
-      } catch (_) {}
-    }
-
-    return keys;
-  }
-
-  async function getKeyInfo(threadId) {
-    if (!threadId) return null;
-    if (keyCache.has(threadId)) return keyCache.get(threadId);
-
-    const record = await store.getConversation(threadId);
-    let info = null;
-    if (record) {
-      const candidateKeys = await buildCandidateKeys(record);
-      if (candidateKeys.length > 0) {
-        info = {
-          key: candidateKeys[0].aesKey,
-          rawBytes: candidateKeys[0].rawBytes,
-          candidateKeys: candidateKeys.map((c) => c.aesKey),
-          mode: record.mode,
-          verified: record.mode === "passphrase" ? true : Boolean(record.verified),
-          quantumSafe:
-            record.mode === "ecdh" ? record.quantumSafe !== false : true,
-          ownTokens: Array.isArray(record.ownTokens) ? record.ownTokens : [],
-        };
-      }
-    }
-    keyCache.set(threadId, info);
-    return info;
-  }
-
-  async function tryDecryptWithKey(aesKey, blob, threadId) {
-    try {
-      return await gpvCrypto.decryptMessage(aesKey, blob, {
-        returnEnvelope: true,
-      });
-    } catch (_) {
-      if (threadId) {
-        return await gpvCrypto.decryptMessage(aesKey, blob, {
-          aad: threadId,
-          returnEnvelope: true,
-        });
-      }
-      throw _;
-    }
-  }
-
-  /**
-   * Check whether two DOM elements (`existingEl` and `el`) are distinct sibling
-   * message bubbles inside the same conversation message list (as opposed to
-   * a wrapper/child pair, a sidebar preview vs. chat bubble, or a re-render).
-   */
-  function areDistinctSiblingMessageBubbles(existingEl, el) {
-    if (!existingEl || !el || existingEl === el) return false;
-    if (!existingEl.isConnected || !el.isConnected) return false;
-    if (existingEl.contains(el) || el.contains(existingEl)) return false;
-
-    const p1 = existingEl.parentElement || existingEl.parentNode;
-    const p2 = el.parentElement || el.parentNode;
-    if (!p1 || !p2 || p1 === p2) return false;
-
-    const gp1 = p1.parentElement || p1.parentNode;
-    const gp2 = p2.parentElement || p2.parentNode;
-    if (!gp1 || !gp2 || gp1 !== gp2) return false;
-
-    return true;
-  }
-
-  async function decryptForThread(threadId, blob, el = null) {
-    const vault = await store.getVaultStatus();
-    if (vault.locked) return { ok: false, reason: "vault-locked" };
-
-    let info = await getKeyInfo(threadId);
-    if (!info || !info.key) return { ok: false, reason: "no-key" };
-
-    let decoded = null;
-    const keysToTry = info.candidateKeys || [info.key];
-
-    for (const candidateKey of keysToTry) {
-      try {
-        decoded = await tryDecryptWithKey(candidateKey, blob, threadId);
-        if (decoded) break;
-      } catch (_) {}
-    }
-
-    if (!decoded) {
-      try {
-        keyCache.delete(threadId);
-        await completeExchangeIfReady(threadId);
-        info = await getKeyInfo(threadId);
-        if (info && info.candidateKeys) {
-          for (const candidateKey of info.candidateKeys) {
-            try {
-              decoded = await tryDecryptWithKey(candidateKey, blob, threadId);
-              if (decoded) break;
-            } catch (_) {}
-          }
-        }
-      } catch (_) {}
-    }
-
-    if (!decoded) {
-      try {
-        const allStorage = await chrome.storage.local.get(null);
-        for (const [k, otherRec] of Object.entries(allStorage)) {
-          if (!k.startsWith("conv:") || k === "conv:" + threadId) continue;
-          const otherThreadId = k.slice(5);
-          const otherCandidates = await buildCandidateKeys(otherRec);
-          for (const cand of otherCandidates) {
-            try {
-              decoded = await tryDecryptWithKey(cand.aesKey, blob, otherThreadId);
-              if (decoded) break;
-            } catch (_) {}
-          }
-          if (decoded) break;
-        }
-      } catch (_) {}
-    }
-
-    if (!decoded) {
-      return { ok: false, reason: "bad" };
-    }
-
-    const token =
-      (decoded.envelope && decoded.envelope.id) || decoded.ivB64;
-
-    if (el && token) {
-      const isOwnSent = Boolean(
-        info && Array.isArray(info.ownTokens) && info.ownTokens.includes(token)
-      );
-      const keyId = `${threadId || "global"}:${token}`;
-      const existingEntry = activeTokenElements.get(keyId);
-      const existingEl = existingEntry ? existingEntry.el : null;
-      const sameScanPass = Boolean(
-        existingEntry && existingEntry.scanId === currentScanPassId
-      );
-      if (
-        !isOwnSent &&
-        !sameScanPass &&
-        areDistinctSiblingMessageBubbles(existingEl, el)
-      ) {
-        return { ok: false, reason: "replay" };
-      }
-      activeTokenElements.set(keyId, { el, scanId: currentScanPassId });
-    }
-
-    let chunkLabel = null;
-    if (
-      decoded.envelope &&
-      decoded.envelope.ct &&
-      decoded.envelope.ct > 1
-    ) {
-      chunkLabel = `${decoded.envelope.ci}/${decoded.envelope.ct}`;
-    }
-
-    return {
-      ok: true,
-      text: decoded.text,
-      quantumSafe: info ? info.quantumSafe : true,
-      chunkLabel,
-      seq: decoded.envelope ? decoded.envelope.seq : null,
-    };
-  }
-
-  // ── Explaining Missing or Unverified Keys ────────────────────────────────
-
-  async function showMissingOrUnverifiedToast(threadId) {
-    const vault = await store.getVaultStatus();
-    if (vault.locked) {
-      ui.showToast(
-        "Your VeilX Vault is locked. Unlock it in the VeilX popup before sending.",
-        { kind: "warning" }
-      );
-      return;
-    }
-
-    const record = threadId ? await store.getConversation(threadId) : null;
-    if (record && record.mode === "ecdh") {
-      if (record.keyB64 && settings.requireVerification && !record.verified) {
-        const identity = await store.getIdentity();
-        const code =
-          identity && record.peerPub
-            ? await gpvCrypto.safetyCode(identity.publicKey, record.peerPub)
-            : "";
-        ui.showToast(
-          `Verify safety code (${code}) with your contact before sending.`,
-          {
-            kind: "warning",
-            actionLabel: "Verify Code",
-            timeoutMs: 0,
-            onAction: async () => {
-              await store.verifyConversation(threadId);
-              keyCache.delete(threadId);
-              await syncComposerState();
-              ui.showToast("Safety code verified! You can now send messages.", {
-                kind: "info",
-              });
-            },
-          }
-        );
-        return;
-      }
-      if (record.sentMyKey && !record.peerPub) {
-        ui.showToast(
-          "Your key exchange is not finished yet: waiting for your contact to send their key.",
-          { kind: "warning" }
-        );
-        return;
-      }
-      if (record.peerPub && (!record.sentMyKey || !record.pqSharedB64)) {
-        ui.showToast(
-          "Your key exchange is not finished yet: send your key to complete the ML-KEM-768 handshake.",
-          {
-            kind: "warning",
-            actionLabel: "Send my key",
-            onAction: () => sendMyKey(),
-          }
-        );
-        return;
-      }
-    }
-    ui.showToast(
-      "No key is set for this chat. Set a passphrase in the popup or click Send my key.",
-      {
-        kind: "warning",
-        actionLabel: "Send my key",
-        onAction: () => sendMyKey(),
-      }
-    );
-  }
-
-  // ── Sending Logic ────────────────────────────────────────────────────────
+  // ── Posting into Instagram's box (ciphertext / key packets only) ─────────
 
   function submitMessage(input) {
     if (!dom.clickSendButton()) dom.pressEnter(input);
   }
 
-  async function encryptAndSendPlaintext(plaintext, fromNative = false, chunkMeta = null) {
-    if (sending) return false;
-    const trimmed = (plaintext || "").trim();
-    if (!trimmed) return false;
-
-    const input = dom.findMessageInput();
-    if (!input) {
-      ui.showToast("Open a chat first.", { kind: "error" });
-      return false;
-    }
-
-    sending = true;
-    try {
-      if (!settings.enabled) {
-        if (!fromNative) {
-          const ready = await dom.writeInputText(input, trimmed);
-          if (!ready) return false;
-        }
-        submitMessage(input);
-        return true;
+  async function postToChat(texts, isValid, fast = false) {
+    for (const t of texts) {
+      if (typeof t !== "string" || t.length > util.MAX_MESSAGE_CHARS || !isValid(t)) {
+        throw new Error("Refusing to post: not a VeilX ciphertext.");
       }
-
-      const threadId = dom.getThreadId();
-      const info = await getKeyInfo(threadId);
-      if (
-        !info ||
-        !info.key ||
-        (info.mode === "ecdh" && settings.requireVerification && !info.verified)
-      ) {
-        await showMissingOrUnverifiedToast(threadId);
-        return false;
-      }
-
-      const seq = await store.allocateNextSeq(threadId);
-      const msgId = gpvCrypto.bytesToBase64(
-        crypto.getRandomValues(new Uint8Array(8))
-      );
-      await store.recordOwnSentToken(threadId, msgId);
-
-      const blob = await gpvCrypto.encryptMessage(info.key, trimmed, {
-        pad: settings.padMessages,
-        envelope: {
-          seq,
-          ts: Date.now(),
-          id: msgId,
-          gid: chunkMeta ? chunkMeta.gid : undefined,
-          ci: chunkMeta ? chunkMeta.ci : undefined,
-          ct: chunkMeta ? chunkMeta.ct : undefined,
-        },
-      });
-
-      if (blob.length > util.MAX_MESSAGE_CHARS) {
-        ui.showToast(
-          "Message is too long once encrypted. Please shorten or split it.",
-          { kind: "error" }
-        );
-        return false;
-      }
-
-      const ready = await dom.writeInputText(input, blob);
-      if (!ready || dom.readInputText(input) !== blob) {
-        await dom.writeInputText(input, fromNative ? trimmed : "");
-        ui.showToast(
-          "Could not safely place encrypted text in the box. Nothing was sent.",
-          { kind: "error" }
-        );
-        return false;
-      }
-      submitMessage(input);
-      return true;
-    } finally {
-      sending = false;
-    }
-  }
-
-  async function sendCiphertext(blob, requestedThreadId) {
-    if (
-      typeof blob !== "string" ||
-      !blob.startsWith(MSG_PREFIX) ||
-      blob.length > util.MAX_MESSAGE_CHARS
-    ) {
-      throw new Error("Invalid encrypted message.");
-    }
-    try {
-      if (gpvCrypto.base64ToBytes(blob.slice(MSG_PREFIX.length)).length < 28) {
-        throw new Error();
-      }
-    } catch (err) {
-      throw new Error("Invalid encrypted message.");
-    }
-    if (
-      typeof requestedThreadId === "string" &&
-      requestedThreadId &&
-      dom.getThreadId() &&
-      requestedThreadId !== dom.getThreadId()
-    ) {
-      throw new Error("The open chat changed. Try again.");
     }
     const input = dom.findMessageInput();
     if (!input) throw new Error("Open a chat first.");
-    if (dom.readInputText(input)) {
-      throw new Error("Clear Instagram's message box before sending securely.");
-    }
+    if (dom.readInputText(input)) throw new Error("Clear Instagram's message box before sending securely.");
+
     sending = true;
     try {
-      const ready = await dom.writeInputText(input, blob);
-      if (!ready || dom.readInputText(input) !== blob) {
-        await dom.writeInputText(input, "");
-        throw new Error(
-          "Could not safely prepare the encrypted message. Nothing was sent."
-        );
-      }
-      // Submit ONCE and wait 150ms (never double-fire pressEnter after clickSendButton,
-      // which previously created a stuck second optimistic send in Instagram's queue!).
-      submitMessage(input);
-      await dom.wait(150);
-      if (dom.readInputText(input).startsWith(MSG_PREFIX)) {
-        throw new Error(
-          "Instagram did not send the ciphertext. It remains in the message box."
-        );
+      const interDelay = fast ? 45 : 90;
+      const finalDelay = fast ? 35 : 70;
+      for (let i = 0; i < texts.length; i++) {
+        const ready = await dom.writeInputText(input, texts[i]);
+        if (!ready || dom.readInputText(input) !== texts[i]) {
+          await dom.writeInputText(input, "");
+          throw new Error("Could not safely prepare the encrypted message. Nothing was sent.");
+        }
+        submitMessage(input);
+        await dom.wait(i < texts.length - 1 ? interDelay : finalDelay);
+        if (dom.readInputText(input) === texts[i]) {
+          throw new Error("Instagram did not send the message. It remains in the message box.");
+        }
       }
       return { ok: true };
     } finally {
@@ -448,531 +74,331 @@
     }
   }
 
-  async function sendRawPackets(packets) {
-    const input = dom.findMessageInput();
-    if (!input) throw new Error("Open a chat first.");
-    if (dom.readInputText(input)) {
-      throw new Error("The message box is not empty. Clear it and try again.");
-    }
+  const isBlob = (t) => Boolean(P.parseMessage(t));
+  const isKeyPacket = (t) => Boolean(P.parseKeyPacket(t));
 
-    sending = true;
-    try {
-      for (let i = 0; i < packets.length; i++) {
-        const ready = await dom.writeInputText(input, packets[i]);
-        if (!ready) throw new Error("Could not write into the message box.");
-        submitMessage(input);
-        if (i < packets.length - 1) await dom.wait(180);
-      }
-    } finally {
-      sending = false;
+  async function sendCiphertext(blobOrBlobs, requestedThreadId, fast = false) {
+    if (requestedThreadId && dom.getThreadId() && requestedThreadId !== dom.getThreadId()) {
+      throw new Error("The open chat changed. Try again.");
     }
+    const list = Array.isArray(blobOrBlobs) ? blobOrBlobs : [blobOrBlobs];
+    return postToChat(list, isBlob, Boolean(fast || list.length > 1));
   }
 
-  // ── Defense-in-Depth Interception on Native Box ──────────────────────────
+  // ── Key exchange actions ─────────────────────────────────────────────────
 
-  function attachNativeInterceptors() {
-    document.addEventListener(
-      "keydown",
-      (e) => {
-        if (e._veilxSynthetic) return;
-        if (!dom.isDmPage()) return;
-        if (e.key !== "Enter" || e.shiftKey) return;
-        if (e.isComposing || e.keyCode === 229) return;
-
-        const input = dom.findMessageInput();
-        if (!input) return;
-        if (e.target !== input && !input.contains(e.target)) return;
-
-        if (!settings.enabled) return;
-
-        e.preventDefault();
-        e.stopImmediatePropagation();
-
-        if (sending) return;
-        const text = dom.readInputText(input);
-        if (!text || text.startsWith(MSG_PREFIX) || text.startsWith(KEY_PREFIX)) {
-          return;
-        }
-        encryptAndSendPlaintext(text, true).catch((err) =>
-          console.error("[VeilX] send error:", err)
-        );
-      },
-      true
-    );
-
-    document.addEventListener(
-      "click",
-      (e) => {
-        if (!dom.isDmPage()) return;
-        if (!settings.enabled) return;
-
-        const sendBtn = dom.closestSendButton(e.target);
-        if (!sendBtn) return;
-
-        const input = dom.findMessageInput();
-        if (!input) return;
-
-        const text = dom.readInputText(input);
-        if (!text || text.startsWith(MSG_PREFIX) || text.startsWith(KEY_PREFIX)) {
-          return;
-        }
-
-        e.preventDefault();
-        e.stopImmediatePropagation();
-
-        if (sending) return;
-        encryptAndSendPlaintext(text, true).catch((err) =>
-          console.error("[VeilX] send click error:", err)
-        );
-      },
-      true
-    );
-  }
-
-  // ── Standardized NIST FIPS 203 ML-KEM-768 + ECDH P-256 Handshake ─────────
-
-  function getOrderedPqSecrets(myPublicB64, peerPublicB64, record) {
-    const myPq = record ? record.myPqSecretB64 || null : null;
-    const peerPq = record ? record.decapsulatedPqB64 || null : null;
-    const legacyPq = record ? record.pqSharedB64 || null : null;
-
-    const ordered = [];
-    const add = (s) => {
-      if (s && !ordered.includes(s)) ordered.push(s);
-    };
-
-    if (myPq && peerPq) {
-      if (myPublicB64 <= peerPublicB64) {
-        add(myPq);
-        add(peerPq);
-      } else {
-        add(peerPq);
-        add(myPq);
-      }
-    } else {
-      add(peerPq);
-      add(myPq);
-    }
-    add(legacyPq);
-    return ordered;
-  }
-
-  async function completeExchangeIfReady(threadId) {
-    const record = await store.getConversation(threadId);
-    if (
-      !record ||
-      record.mode !== "ecdh" ||
-      !record.peerPub ||
-      !record.sentMyKey
-    ) {
-      return;
-    }
-
-    const identity = await store.getIdentity();
-    if (!identity) return;
-
-    const myBundle = gpvCrypto.parsePublicKeyBundle(identity.publicKey);
-    const peerBundle = gpvCrypto.parsePublicKeyBundle(record.peerPub);
-    const bothQuantumSafe = Boolean(myBundle.quantumSafe && peerBundle.quantumSafe);
-
-    const orderedPqSecrets = getOrderedPqSecrets(
-      identity.publicKey,
-      record.peerPub,
-      record
-    );
-
-    if (bothQuantumSafe && orderedPqSecrets.length === 0) {
-      return;
-    }
-
-    const derivedKeysB64 = [];
-    if (bothQuantumSafe) {
-      for (const pqB64 of orderedPqSecrets) {
-        const pqBytes = gpvCrypto.base64ToBytes(pqB64);
-        const kBytes = await gpvCrypto.deriveSharedKey(
-          identity.privateJwk,
-          identity.publicKey,
-          record.peerPub,
-          pqBytes
-        );
-        const kB64 = gpvCrypto.bytesToBase64(kBytes);
-        if (!derivedKeysB64.includes(kB64)) derivedKeysB64.push(kB64);
-      }
-    } else {
-      const kBytes = await gpvCrypto.deriveSharedKey(
-        identity.privateJwk,
-        identity.publicKey,
-        record.peerPub,
-        null
-      );
-      derivedKeysB64.push(gpvCrypto.bytesToBase64(kBytes));
-    }
-
-    if (record.keyB64 && !derivedKeysB64.includes(record.keyB64)) {
-      derivedKeysB64.push(record.keyB64);
-    }
-    if (Array.isArray(record.altKeysB64)) {
-      for (const oldAlt of record.altKeysB64) {
-        if (oldAlt && !derivedKeysB64.includes(oldAlt)) {
-          derivedKeysB64.push(oldAlt);
-        }
-      }
-    }
-
-    const primaryKeyB64 = derivedKeysB64[0];
-    const altKeysB64 = derivedKeysB64.slice(1);
-    const primaryPqB64 = orderedPqSecrets[0] || record.pqSharedB64 || null;
-
-    const alreadyUpToDate =
-      record.keyB64 === primaryKeyB64 &&
-      record.pqSharedB64 === primaryPqB64 &&
-      JSON.stringify(record.altKeysB64 || []) === JSON.stringify(altKeysB64);
-
-    if (alreadyUpToDate) {
-      return;
-    }
-
-    const hadKeyBefore = Boolean(record.keyB64);
-    const code = await gpvCrypto.safetyCode(identity.publicKey, record.peerPub);
-
-    await store.saveConversation(threadId, {
-      ...record,
-      keyB64: primaryKeyB64,
-      altKeysB64,
-      pqSharedB64: primaryPqB64,
-      chainKeyB64: primaryKeyB64,
-      quantumSafe: bothQuantumSafe,
-      verified: Boolean(record.verified),
-    });
-    keyCache.delete(threadId);
-    retryPending();
-
-    if (!hadKeyBefore) {
-      if (settings.requireVerification && !record.verified) {
-        ui.showToast(
-          `ML-KEM-768 key ready! Safety code: ${code}. Click Verify Code after confirming with your contact.`,
-          {
-            kind: "info",
-            actionLabel: "Verify Code",
-            timeoutMs: 0,
-            onAction: async () => {
-              await store.verifyConversation(threadId);
-              keyCache.delete(threadId);
-              await syncComposerState();
-              ui.showToast("Safety code verified! Conversation unlocked.", {
-                kind: "info",
-              });
-            },
-          }
-        );
-      } else {
-        ui.showToast(
-          bothQuantumSafe
-            ? `NIST FIPS 203 ML-KEM-768 + P-256 key established! Safety code: ${code}`
-            : `ECDH key established! Safety code: ${code}`,
-          { kind: "info", timeoutMs: 9000 }
-        );
-      }
-    }
-    await syncComposerState();
-  }
-
-  async function sendMyKey() {
+  async function startExchange() {
     const threadId = dom.getThreadId();
-    if (!threadId) return { ok: false, error: "Open a chat first." };
-
-    const existing = await store.getConversation(threadId);
-    if (existing && existing.mode === "passphrase" && existing.keyB64) {
-      return {
-        ok: false,
-        error: "This chat already uses a passphrase. Remove it first.",
-      };
-    }
-
-    const identity = await store.getOrCreateIdentity();
-    let kemCiphertextB64 = null;
-    let myPqSecretB64 = existing ? existing.myPqSecretB64 || null : null;
-    let myKemPeerPub = existing ? existing.myKemPeerPub || null : null;
-    const decapsulatedPqB64 = existing ? existing.decapsulatedPqB64 || null : null;
-
-    if (existing && existing.peerPub) {
-      const peerBundle = gpvCrypto.parsePublicKeyBundle(existing.peerPub);
-      if (peerBundle.quantumSafe) {
-        if (
-          myKemPeerPub === existing.peerPub &&
-          existing.myKemCtB64 &&
-          myPqSecretB64
-        ) {
-          kemCiphertextB64 = existing.myKemCtB64;
-        } else if (!decapsulatedPqB64) {
-          const encapsulated = await gpvCrypto.pqEncapsulate(existing.peerPub);
-          kemCiphertextB64 = encapsulated.ciphertextB64;
-          myPqSecretB64 = gpvCrypto.bytesToBase64(encapsulated.sharedSecret);
-          myKemPeerPub = existing.peerPub;
-        }
-      }
-    }
-
-    const packets = gpvCrypto.makeKeyPackets(
-      identity.publicKey,
-      kemCiphertextB64
-    );
-    await sendRawPackets(packets);
-
-    const updatedRecord = {
-      ...(existing || {}),
-      mode: "ecdh",
-      peerPub: existing ? existing.peerPub || null : null,
-      keyB64: existing ? existing.keyB64 || null : null,
-      myKemCtB64: kemCiphertextB64 || (existing ? existing.myKemCtB64 || null : null),
-      myPqSecretB64,
-      myKemPeerPub,
-      decapsulatedPqB64,
-      pqSharedB64: decapsulatedPqB64 || myPqSecretB64 || (existing ? existing.pqSharedB64 || null : null),
-      sentMyKey: true,
-      verified: existing ? Boolean(existing.verified) : false,
-      quantumSafe: Boolean(identity.quantumSafe),
-    };
-
-    await store.saveConversation(threadId, updatedRecord);
-    keyCache.delete(threadId);
-    await completeExchangeIfReady(threadId);
-    await syncComposerState();
+    if (!threadId) throw new Error("Open a chat first.");
+    const { packets } = await session.createOffer(threadId);
+    await postToChat(packets, isKeyPacket);
     return { ok: true };
   }
 
-  async function processKeyMessages(threadId, entries) {
-    const peerKeys = entries.filter((e) => !e.isOwn);
-    if (peerKeys.length === 0) return;
+  async function acceptIncoming() {
+    const threadId = dom.getThreadId();
+    const pending = threadId && incomingOffers.get(threadId);
+    if (!pending) throw new Error("There is no key offer from your contact to accept.");
+    const { packets } = await session.acceptOffer(threadId, pending.entry);
+    incomingOffers.delete(threadId);
+    await postToChat(packets, isKeyPacket);
+    return { ok: true };
+  }
 
-    const newestEntry = peerKeys[peerKeys.length - 1];
-    const newestPub = newestEntry.publicKeyB64;
-    let newestKemCt = newestEntry.kemCiphertextB64 || null;
-    if (!newestKemCt) {
-      for (let i = peerKeys.length - 1; i >= 0; i--) {
-        if (
-          peerKeys[i].publicKeyB64 === newestPub &&
-          peerKeys[i].kemCiphertextB64
-        ) {
-          newestKemCt = peerKeys[i].kemCiphertextB64;
+  function offerToast(threadId, replaces) {
+    ui.showToast(
+      replaces
+        ? "Your contact started a NEW key exchange. Accept only if they told you they re-installed or changed device."
+        : "Your contact started a quantum-safe key exchange.",
+      {
+        kind: "warning", actionLabel: "Accept", timeoutMs: 0,
+        onAction: () => acceptIncoming().then(
+          () => ui.showToast("Reply sent. Compare the safety code in the VeilX popup before chatting.", { kind: "info" }),
+          (err) => ui.showToast(err.message || "Could not accept.", { kind: "error" })
+        ),
+      }
+    );
+  }
+
+  async function handleKeyEntries(threadId, entries) {
+    const events = await session.processKeyEntries(threadId, entries);
+    for (const ev of events) {
+      if (ev.type === "established") {
+        ui.showToast("Key exchange complete. Open the VeilX popup and compare the safety code with your contact.", { kind: "info", timeoutMs: 12000 });
+      } else if (ev.type === "auto-accepted") {
+        postToChat(ev.packets, isKeyPacket).catch((err) => ui.showToast(err.message, { kind: "error" }));
+        ui.showToast("Both of you started at once; completing the exchange. Compare the safety code in the popup.", { kind: "info" });
+      } else if (ev.type === "offer-received") {
+        const prev = incomingOffers.get(threadId);
+        incomingOffers.set(threadId, { entry: ev.entry, replaces: ev.replacesSession });
+        if (!prev || prev.entry.id !== ev.entry.id) offerToast(threadId, ev.replacesSession);
+      }
+    }
+    if (events.length) await syncComposerState();
+  }
+
+  // ── Zero-Knowledge Relay Sidecar Download & Decryption ───────────────────
+
+  function askBackgroundDownload(url) {
+    return new Promise((resolve) => {
+      if (typeof chrome === "undefined" || !chrome.runtime || typeof chrome.runtime.sendMessage !== "function") {
+        resolve(null);
+        return;
+      }
+      try {
+        const maybe = chrome.runtime.sendMessage({ type: "VX_RELAY_DOWNLOAD", url }, (reply) => resolve(reply || null));
+        if (maybe && typeof maybe.then === "function") {
+          maybe.then((res) => resolve(res || null), () => resolve(null));
+        }
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  }
+
+  async function fetchAndDecryptSidecar(sidecar, onProgress) {
+    if (!sidecar || typeof sidecar.u !== "string" || !sidecar.k || !sidecar.h) {
+      throw new Error("Malformed sidecar media pointer.");
+    }
+    if (sidecarCache.has(sidecar.u)) {
+      return sidecarCache.get(sidecar.u);
+    }
+
+    if (typeof onProgress === "function") onProgress(25, "Downloading encrypted media from Relay (25%)…");
+    let envelopeBytes = null;
+    if (typeof window.vxRelayFetch === "function") {
+      const resp = await window.vxRelayFetch(sidecar.u, { method: "GET" });
+      if (!resp || !resp.ok) {
+        throw new Error(`Encrypted media blob expired or unavailable (HTTP ${resp ? resp.status : "error"}).`);
+      }
+      envelopeBytes = new Uint8Array(await resp.arrayBuffer());
+    } else {
+      if (typeof globalThis.fetch === "function") {
+        try {
+          const resp = await globalThis.fetch(sidecar.u, { method: "GET" });
+          if (resp && resp.ok) {
+            envelopeBytes = new Uint8Array(await resp.arrayBuffer());
+          }
+        } catch (_) {}
+      }
+      if (!envelopeBytes) {
+        const swRes = await askBackgroundDownload(sidecar.u);
+        if (swRes && swRes.ok && swRes.bodyB64) {
+          envelopeBytes = C.base64ToBytes(swRes.bodyB64);
+        } else {
+          throw new Error((swRes && swRes.error) || "Encrypted media blob expired or unavailable.");
+        }
+      }
+    }
+
+    if (typeof onProgress === "function") onProgress(75, "Verifying SHA-256 & decrypting AES-256-GCM (75%)…");
+    const rawMt = String(sidecar.mt || "image/webp").split(";")[0].trim().toLowerCase();
+    const mimeType = ALLOWED_SIDECAR_MIME_RE.test(rawMt) ? rawMt : "image/webp";
+    const plainBytes = await C.openMediaBinary(envelopeBytes, sidecar.k, sidecar.h, mimeType);
+    if (typeof onProgress === "function") onProgress(95, "Rendering decrypted media (95%)…");
+    const dataUrl = `data:${mimeType};base64,${C.bytesToBase64(plainBytes)}`;
+    sidecarCache.set(sidecar.u, dataUrl);
+    return dataUrl;
+  }
+
+  // ── Multi-Message In-Band Image Reassembly & Decryption ──────────────────
+
+  function renderImageGroup(group) {
+    let anchorCi = -1;
+    for (const [ci, ctrl] of group.controllers.entries()) {
+      if (!ctrl || !ctrl.isConnected()) {
+        group.controllers.delete(ci);
+        continue;
+      }
+      if (ci > anchorCi) anchorCi = ci;
+    }
+    if (anchorCi < 0) return;
+
+    for (const [ci, ctrl] of group.controllers.entries()) {
+      if (ci !== anchorCi) {
+        ctrl.setCollapsed(true);
+      }
+    }
+
+    const anchorCtrl = group.controllers.get(anchorCi);
+    if (!anchorCtrl) return;
+
+    let complete = group.parts.size >= group.ct;
+    let assembled = "";
+    if (complete) {
+      for (let i = 1; i <= group.ct; i++) {
+        const part = group.parts.get(i);
+        if (typeof part !== "string") {
+          complete = false;
           break;
         }
+        assembled += part;
       }
     }
 
-    const record = await store.getConversation(threadId);
-    if (record && record.mode === "passphrase") return;
-
-    const identity = await store.getIdentity();
-    let decapsulatedB64 = record ? record.decapsulatedPqB64 || null : null;
-    if (newestKemCt && identity && identity.privateJwk) {
-      try {
-        const sharedBytes = await gpvCrypto.pqDecapsulate(
-          identity.privateJwk,
-          newestKemCt
-        );
-        decapsulatedB64 = gpvCrypto.bytesToBase64(sharedBytes);
-      } catch (err) {
-        console.error("[VeilX] ML-KEM-768 decapsulation failed:", err);
-      }
-    }
-
-    if (!record || !record.peerPub) {
-      await store.saveConversation(threadId, {
-        ...(record || {}),
-        mode: "ecdh",
-        peerPub: newestPub,
-        keyB64: null,
-        decapsulatedPqB64: decapsulatedB64,
-        pqSharedB64: decapsulatedB64 || (record ? record.myPqSecretB64 || null : null),
-        sentMyKey: record ? Boolean(record.sentMyKey) : false,
-        verified: false,
-        quantumSafe: newestEntry.quantumSafe,
+    if (complete && assembled.startsWith("data:image/")) {
+      anchorCtrl.showMedia(assembled, {
+        badge: group.badge,
+        chunkLabel: `In-Band · ${group.ct} parts`,
       });
-      keyCache.delete(threadId);
-
-      if (record && record.sentMyKey) {
-        if (
-          !decapsulatedB64 &&
-          !(record.myPqSecretB64 && record.myKemPeerPub === newestPub) &&
-          newestEntry.quantumSafe &&
-          !sending
-        ) {
-          await sendMyKey();
-        } else {
-          await completeExchangeIfReady(threadId);
-        }
-      } else {
-        ui.showToast(
-          "Your contact started a Quantum-Safe chat. Send your key to finish setting it up.",
-          {
-            kind: "info",
-            actionLabel: "Send my key",
-            timeoutMs: 0,
-            onAction: () =>
-              sendMyKey()
-                .then((r) => {
-                  if (!r.ok) ui.showToast(r.error, { kind: "error" });
-                })
-                .catch((err) => ui.showToast(err.message, { kind: "error" })),
-          }
-        );
-      }
-      await syncComposerState();
-      return;
-    }
-
-    if (record.peerPub === newestPub) {
-      if (decapsulatedB64 && record.decapsulatedPqB64 !== decapsulatedB64) {
-        await store.saveConversation(threadId, {
-          ...record,
-          decapsulatedPqB64: decapsulatedB64,
-          pqSharedB64: decapsulatedB64,
-        });
-        keyCache.delete(threadId);
-        await completeExchangeIfReady(threadId);
-        await syncComposerState();
-      } else if (!record.keyB64) {
-        await completeExchangeIfReady(threadId);
-      }
-      return;
-    }
-
-    if (record.peerPub !== newestPub) {
-      const warnId = threadId + ":" + newestPub;
-      if (warnedKeyChanges.has(warnId)) return;
-      warnedKeyChanges.add(warnId);
-
-      ui.showToast(
-        "Your contact's key has changed (new device or reinstall?). Only accept it if you can confirm the new safety code with them another way.",
-        {
-          kind: "warning",
-          actionLabel: "Use new key",
-          timeoutMs: 0,
-          onAction: async () => {
-            try {
-              await store.saveConversation(threadId, {
-                mode: "ecdh",
-                peerPub: newestPub,
-                keyB64: null,
-                altKeysB64: [],
-                myKemCtB64: null,
-                myPqSecretB64: null,
-                myKemPeerPub: null,
-                decapsulatedPqB64: decapsulatedB64,
-                pqSharedB64: decapsulatedB64,
-                sentMyKey: false,
-                verified: false,
-                quantumSafe: newestEntry.quantumSafe,
-              });
-              keyCache.delete(threadId);
-              await sendMyKey();
-              await syncComposerState();
-            } catch (err) {
-              ui.showToast("Could not switch to the new key: " + err.message, {
-                kind: "error",
-              });
-            }
-          },
-        }
+    } else {
+      anchorCtrl.showProgress(
+        `Reassembling encrypted image (${group.parts.size}/${group.ct} parts)…`,
+        { badge: group.badge }
       );
     }
   }
 
-  // ── Mounting & Updating VeilX's Composer ─────────────────────────────────
+  async function decryptForThread(threadId, blob, controller) {
+    if (!threadId) return { ok: false, reason: "no-key" };
+    const r = await session.decryptBlob(threadId, blob);
+    if (!r.ok) return r;
+    const m = r.meta || {};
+    let badge;
+    if (m.mode === "passphrase") badge = "Passphrase · no forward secrecy";
+    else badge = m.verified ? "PQ · forward-secret" : "PQ · unverified key";
+
+    // Option B: 1-DM Zero-Knowledge Sidecar Media Pointer (Images, Short Videos, Voice Notes)
+    if (m.m === "sidecar" && m.sidecar && m.sidecar.u) {
+      if (controller) {
+        controller.showProgress("🔓 Downloading encrypted media (15%)…", { badge, percent: 15 });
+      }
+      const dataUrl = await fetchAndDecryptSidecar(m.sidecar, (pct, msg) => {
+        if (controller) controller.showProgress(`🔓 ${msg}`, { badge, percent: pct });
+      });
+      return {
+        ok: true,
+        text: dataUrl,
+        badge,
+        isImage: true,
+        isMedia: true,
+        chunkLabel: "R2 Relay · 1 DM",
+      };
+    }
+
+    const isImgPayload =
+      m.m === "img" ||
+      ((!m.ci || m.ci === 1) && typeof r.text === "string" && r.text.startsWith("data:image/"));
+
+    if (m.gid && m.ct > 1 && (isImgPayload || imageGroups.has(`${threadId}:${m.gid}`))) {
+      const gKey = `${threadId}:${m.gid}`;
+      let group = imageGroups.get(gKey);
+      if (!group) {
+        group = { ct: m.ct, badge, parts: new Map(), controllers: new Map() };
+        imageGroups.set(gKey, group);
+      }
+      group.ct = m.ct;
+      group.badge = badge;
+      group.parts.set(m.ci, r.text);
+      if (controller) group.controllers.set(m.ci, controller);
+
+      if (group.parts.size < group.ct && typeof session.getGroupChunks === "function") {
+        const stored = await session.getGroupChunks(threadId, m.gid);
+        if (stored && stored.parts) {
+          for (const [k, v] of Object.entries(stored.parts)) {
+            const idx = Number(k);
+            if (!group.parts.has(idx)) group.parts.set(idx, v);
+          }
+        }
+      }
+
+      renderImageGroup(group);
+      return { ok: true, text: r.text, badge, handledByGroup: true };
+    }
+
+    if ((!m.ct || m.ct === 1) && isImgPayload) {
+      return {
+        ok: true,
+        text: r.text,
+        badge,
+        isImage: true,
+        isMedia: true,
+        chunkLabel: "In-Band · 1 part",
+      };
+    }
+
+    return {
+      ok: true,
+      text: r.text,
+      badge,
+      chunkLabel: m.ct && m.ct > 1 ? `${m.ci}/${m.ct}` : undefined,
+    };
+  }
+
+  // ── Fail-closed guard for Instagram's own message box ────────────────────
+
+  function attachNativeGuards() {
+    const warn = () =>
+      ui.showToast(
+        "Blocked: typing in Instagram's own box is not private. Use the VeilX composer, or switch VeilX off in the popup.",
+        { kind: "warning" }
+      );
+
+    function shouldBlock() {
+      if (!settings.enabled || !dom.isDmPage()) return false;
+      const input = dom.findMessageInput();
+      if (!input) return false;
+      const text = dom.readInputText(input);
+      if (!text) return false;
+      if (sending && (isBlob(text) || isKeyPacket(text))) return false;
+      return true;
+    }
+
+    document.addEventListener("keydown", (e) => {
+      if (e._veilxSynthetic) return;
+      if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
+      const input = dom.findMessageInput();
+      if (!input || (e.target !== input && !input.contains(e.target))) return;
+      if (!shouldBlock()) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      warn();
+    }, true);
+
+    document.addEventListener("click", (e) => {
+      if (!dom.closestSendButton(e.target)) return;
+      if (!shouldBlock()) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      warn();
+    }, true);
+  }
+
+  // ── Composer mounting ────────────────────────────────────────────────────
 
   async function syncComposerState() {
     const input = dom.findMessageInput();
-    if (input) {
-      dom.setNativeComposerHidden(input, Boolean(settings.enabled));
-    }
-    if (!activeComposer || !activeComposer.isConnected()) return;
-    const threadId = dom.getThreadId();
-    const record = threadId ? await store.getConversation(threadId) : null;
-    activeComposer.updateState({
-      enabled: settings.enabled,
-      beautifyUi: settings.beautifyUi,
-      requireVerification: settings.requireVerification,
-      record,
-      threadId,
-    });
+    const mounted = Boolean(activeComposer && activeComposer.isMounted());
+    if (input) dom.setNativeComposerHidden(input, Boolean(settings.enabled && mounted));
+    if (activeComposer) activeComposer.updateState({ enabled: settings.enabled, threadId: dom.getThreadId() });
   }
 
   async function ensureOnPageComposer() {
     if (!dom.isDmPage()) {
-      if (activeComposer) {
-        activeComposer.remove();
-        activeComposer = null;
-        activeAnchorInput = null;
-      }
+      if (activeComposer) { activeComposer.remove(); activeComposer = null; activeAnchorInput = null; }
       return;
     }
-
     const input = dom.findMessageInput();
     if (!input) return;
 
-    dom.setNativeComposerHidden(input, Boolean(settings.enabled));
-
     const currentThreadId = dom.getThreadId();
-    if (
-      activeComposer &&
-      activeComposer.isConnected() &&
-      activeAnchorInput === input
-    ) {
+    if (activeComposer && activeComposer.isConnected() && activeAnchorInput === input) {
       if (lastThreadId !== currentThreadId) {
         lastThreadId = currentThreadId;
         await syncComposerState();
       }
       return;
     }
-
-    if (activeComposer) {
-      activeComposer.remove();
-      activeComposer = null;
-    }
+    if (activeComposer) { activeComposer.remove(); activeComposer = null; }
 
     const anchorEl = dom.findComposerContainer(input) || input;
     activeAnchorInput = input;
     lastThreadId = currentThreadId;
-
-    activeComposer = ui.renderComposer(anchorEl, {
-      onSendText: async (text) => {
-        const chunks = util.splitIntoChunks(text, util.MAX_PLAINTEXT_BYTES);
-        const gid =
-          chunks.length > 1
-            ? gpvCrypto.bytesToBase64(crypto.getRandomValues(new Uint8Array(4)))
-            : undefined;
-        for (let i = 0; i < chunks.length; i++) {
-          const chunkMeta =
-            chunks.length > 1
-              ? { gid, ci: i + 1, ct: chunks.length }
-              : null;
-          const ok = await encryptAndSendPlaintext(chunks[i], false, chunkMeta);
-          if (!ok) return false;
-          if (i < chunks.length - 1) await dom.wait(220);
-        }
-        return true;
-      },
-      onSendKey: async () => {
-        try {
-          const res = await sendMyKey();
-          if (res.ok) {
-            ui.showToast("ML-KEM-768 + P-256 key sent into the chat.", {
-              kind: "info",
-            });
-          } else {
-            ui.showToast(res.error || "Could not send key.", { kind: "error" });
-          }
-        } catch (err) {
-          ui.showToast(err.message || "Could not send key.", { kind: "error" });
-        }
-      },
-    });
-
+    activeComposer = ui.renderComposer(anchorEl);
     await syncComposerState();
   }
 
-  // ── Scanning & Replacing Encrypted Messages in the Conversation ──────────
+  // ── Scanning ─────────────────────────────────────────────────────────────
 
   let scanTimer = null;
   let scanning = false;
@@ -981,14 +407,11 @@
   function scheduleScan() {
     if (!dom.isDmPage()) return;
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(runScan, 180);
+    scanTimer = setTimeout(runScan, 120);
   }
 
   async function runScan() {
-    if (scanning) {
-      scanAgain = true;
-      return;
-    }
+    if (scanning) { scanAgain = true; return; }
     scanning = true;
     try {
       await ensureOnPageComposer();
@@ -997,218 +420,112 @@
       console.error("[VeilX] scan error:", err);
     } finally {
       scanning = false;
-      if (scanAgain) {
-        scanAgain = false;
-        scheduleScan();
-      }
+      if (scanAgain) { scanAgain = false; scheduleScan(); }
     }
-  }
-
-  function extractBlob(text) {
-    const cleaned = (text || "").replace(/[\u200B-\u200D\uFEFF\u00AD\s]+/g, "");
-    const match = cleaned.match(/^GPV2:[A-Za-z0-9+/]+=*/);
-    return match && match[0].length >= 45 ? match[0] : null;
   }
 
   async function scanMessages() {
     if (!dom.isDmPage()) return;
-    currentScanPassId++;
-
     const input = dom.findMessageInput();
     const pane = dom.getConversationPane(input);
     const root = pane || document.body;
     const threadId = dom.getThreadId();
 
-    const found = dom.findEncryptedElements(root, [MSG_PREFIX, KEY_PREFIX]);
+    const found = dom.findEncryptedElements(root, [P.MSG_PREFIX, P.KEY_PREFIX]);
     if (found.length === 0) return;
 
     const rawKeyTexts = [];
     for (const { el, text, handled } of found) {
-      if (text.startsWith(KEY_PREFIX)) {
-        if (!pane) continue;
-        const parsedPart = gpvCrypto.parseKeyMessage(text);
-        if (!parsedPart) continue;
-        rawKeyTexts.push(text);
-        if (!handled) {
-          const isOwnPart = parsedPart.publicKeyB64
-            ? await store.isOwnPublicKey(parsedPart.publicKeyB64)
-            : false;
-          ui.renderKeyLabel(
-            el,
-            isOwnPart,
-            true,
-            Boolean(parsedPart.kemCiphertextB64)
-          );
-        }
-      }
+      if (!text.startsWith(P.KEY_PREFIX) || !pane) continue;
+      const part = P.parseKeyPacket(text);
+      if (!part) continue;
+      rawKeyTexts.push(text);
+      if (!handled) ui.renderKeyLabel(el, `${part.index}/${part.total}`);
     }
-
     if (threadId && rawKeyTexts.length > 0) {
-      const reassembled = gpvCrypto.reassembleKeyPackets(rawKeyTexts);
-      const keyEntries = [];
-      for (const item of reassembled) {
-        const isOwn = await store.isOwnPublicKey(item.publicKeyB64);
-        keyEntries.push({
-          ...item,
-          b64: item.publicKeyB64,
-          isOwn,
-        });
-      }
-      if (keyEntries.length > 0) {
-        await processKeyMessages(threadId, keyEntries);
-      }
+      const entries = P.reassembleKeyPackets(rawKeyTexts);
+      if (entries.length > 0) await handleKeyEntries(threadId, entries);
     }
 
     let decryptCount = 0;
     for (const { el, text, handled } of found) {
-      if (!text.startsWith(KEY_PREFIX) && !handled) {
-        if (decryptCount >= MAX_DECRYPTS_PER_SCAN) continue;
-        const blob = extractBlob(text);
-        if (!blob) continue;
-        decryptCount++;
-        const controller = ui.renderEncrypted(
-          el,
-          blob,
-          (b) => decryptForThread(threadId, b, el),
-          settings.autoDecrypt
-        );
-        pendingBubbles.add(controller);
-      }
+      if (text.startsWith(P.KEY_PREFIX) || handled) continue;
+      if (decryptCount >= MAX_DECRYPTS_PER_SCAN) continue;
+      const parsed = P.parseMessage(text);
+      if (!parsed) continue;
+      decryptCount++;
+      const controller = ui.renderEncrypted(
+        el,
+        parsed.blob,
+        (b, ctrl) => decryptForThread(threadId, b, ctrl),
+        settings.autoDecrypt
+      );
+      pendingBubbles.add(controller);
     }
   }
 
   function retryPending() {
     let count = 0;
     for (const controller of pendingBubbles) {
-      if (!controller.isConnected()) {
-        pendingBubbles.delete(controller);
-      } else if (
-        !controller.isRevealed() &&
-        settings.autoDecrypt &&
-        count < MAX_DECRYPTS_PER_SCAN
-      ) {
+      if (!controller.isConnected()) pendingBubbles.delete(controller);
+      else if (!controller.isRevealed() && settings.autoDecrypt && count < MAX_DECRYPTS_PER_SCAN) {
         count++;
         controller.retry();
       }
     }
   }
 
-  // ── Privileged Extension IPC Listener (Popup & Background Broker) ────────
+  // ── IPC from the popup / background broker ───────────────────────────────
+
+  const HANDLED_TYPES = new Set([
+    "VX_QUERY", "VX_START_EXCHANGE", "VX_ACCEPT_OFFER", "VX_SEND_CIPHERTEXT",
+    "VX_BROKER_SEND_CIPHERTEXT", "VX_BROKER_START_EXCHANGE", "VX_BROKER_ACCEPT_OFFER", "VX_BROKER_QUERY",
+  ]);
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (sender.id !== chrome.runtime.id) return;
-    if (
-      !message ||
-      ![
-        "GPV_SEND_KEY",
-        "GPV_SEND_CIPHERTEXT",
-        "GPV_BROKER_SEND_KEY",
-        "GPV_BROKER_SEND_CIPHERTEXT",
-      ].includes(message.type)
-    ) {
-      return;
+    if (!message || !HANDLED_TYPES.has(message.type)) return;
+    if (!dom.isDmPage()) return false;
+
+    let work;
+    if (message.type.endsWith("QUERY")) {
+      const tid = dom.getThreadId();
+      const off = tid && incomingOffers.get(tid);
+      work = Promise.resolve({ ok: true, threadId: tid, offer: off ? { replaces: off.replaces } : null });
+    } else if (message.type.endsWith("SEND_CIPHERTEXT")) {
+      work = sendCiphertext(message.ciphertext, message.threadId, Boolean(message.fast));
+    } else if (message.type.endsWith("START_EXCHANGE")) {
+      work = startExchange();
+    } else {
+      work = acceptIncoming();
     }
-
-    // Ignore in hidden Instagram helper subframes so only the frame with the active
-    // DM conversation handles sending and calls `sendResponse`!
-    if (!dom.isDmPage()) {
-      return false;
-    }
-
-    if (
-      message.type === "GPV_SEND_CIPHERTEXT" ||
-      message.type === "GPV_BROKER_SEND_CIPHERTEXT"
-    ) {
-      sendCiphertext(message.ciphertext, message.threadId)
-        .then(sendResponse)
-        .catch((err) => sendResponse({ ok: false, error: err.message }));
-      return true;
-    }
-
-    sendMyKey()
-      .then((result) => sendResponse(result))
-      .catch((err) => sendResponse({ ok: false, error: err.message }));
-
+    work.then(sendResponse).catch((err) => sendResponse({ ok: false, error: err.message }));
     return true;
   });
 
-  // ── Reacting to Storage Changes ──────────────────────────────────────────
-
   chrome.storage.onChanged.addListener((changes) => {
-    let keysChanged = false;
-
+    let stateChanged = false;
     for (const name of Object.keys(changes)) {
-      if (name === "enabled") {
-        settings.enabled = changes.enabled.newValue !== false;
-      }
-      if (name === "autoDecrypt") {
-        settings.autoDecrypt = changes.autoDecrypt.newValue !== false;
-      }
-      if (name === "beautifyUi") {
-        settings.beautifyUi = changes.beautifyUi.newValue !== false;
-        dom.applyPageTheme(settings.beautifyUi);
-      }
-      if (name === "padMessages") {
-        settings.padMessages = changes.padMessages.newValue !== false;
-      }
-      if (name === "requireVerification") {
-        settings.requireVerification =
-          changes.requireVerification.newValue === true;
-      }
-      if (name === "identity" || name === "vaultLocked") {
-        keysChanged = true;
-      }
-      if (name.startsWith("conv:")) {
-        const oldVal = changes[name].oldValue || {};
-        const newVal = changes[name].newValue || {};
-        const threadId = name.slice(5);
-
-        // Update cached ownTokens in-place when we send a message so we don't clear
-        // keyCache or trigger unnecessary DOM re-renders mid-send!
-        if (keyCache.has(threadId) && keyCache.get(threadId)) {
-          keyCache.get(threadId).ownTokens = Array.isArray(newVal.ownTokens)
-            ? newVal.ownTokens
-            : [];
-        }
-
-        if (
-          oldVal.keyB64 !== newVal.keyB64 ||
-          oldVal.pqSharedB64 !== newVal.pqSharedB64 ||
-          oldVal.decapsulatedPqB64 !== newVal.decapsulatedPqB64 ||
-          oldVal.peerPub !== newVal.peerPub ||
-          oldVal.sentMyKey !== newVal.sentMyKey ||
-          oldVal.verified !== newVal.verified ||
-          oldVal.mode !== newVal.mode
-        ) {
-          keysChanged = true;
-        }
-      }
+      const nv = changes[name].newValue;
+      if (name === "enabled") settings.enabled = nv !== false;
+      else if (name === "autoDecrypt") settings.autoDecrypt = nv !== false;
+      else if (name === "beautifyUi") { settings.beautifyUi = nv !== false; dom.applyPageTheme(settings.beautifyUi); }
+      else if (name === "padMessages") settings.padMessages = nv !== false;
+      else if (name === "requireVerification") settings.requireVerification = nv !== false;
+      if (name === "vaultLocked" || name.startsWith("conv:")) stateChanged = true;
     }
-
-    if (keysChanged) keyCache.clear();
-    if (keysChanged || changes.autoDecrypt) retryPending();
-    if (
-      keysChanged ||
-      changes.enabled ||
-      changes.beautifyUi ||
-      changes.requireVerification
-    ) {
-      syncComposerState().catch(() => {});
-    }
+    if (stateChanged || changes.autoDecrypt) retryPending();
+    syncComposerState().catch(() => {});
   });
 
   // ── Start-up ─────────────────────────────────────────────────────────────
 
-  attachNativeInterceptors();
+  attachNativeGuards();
 
   async function boot() {
     settings = await store.getSettings();
     dom.applyPageTheme(settings.beautifyUi);
-
-    new MutationObserver(scheduleScan).observe(document.body, {
-      childList: true,
-      subtree: true,
-    });
+    new MutationObserver(scheduleScan).observe(document.body, { childList: true, subtree: true });
     scheduleScan();
   }
 

@@ -5,15 +5,15 @@
  * works with plain text and web addresses (URLs).
  */
 
-globalThis.GPV = globalThis.GPV || {};
+globalThis.VX = globalThis.VX || {};
 
-GPV.util = (() => {
+VX.util = (() => {
   "use strict";
 
   // Instagram limits how long a single DM can be (~1000 characters).
   const MAX_MESSAGE_CHARS = 1000;
   // Safe UTF-8 byte budget per encrypted message chunk (leaves room for IV, GCM tag, padding, and Base64).
-  const MAX_PLAINTEXT_BYTES = 680;
+  const MAX_PLAINTEXT_BYTES = 560;
 
   /**
    * Find the chat ID inside a web address.
@@ -84,4 +84,4 @@ GPV.util = (() => {
   };
 })();
 
-if (typeof module !== "undefined") module.exports = GPV.util;
+if (typeof module !== "undefined") module.exports = VX.util;

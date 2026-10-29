@@ -1,11 +1,22 @@
 /**
- * src/crypto.js — Standardized NIST FIPS 203 ML-KEM-768 + ECDH P-256 Hybrid
- * Cryptography & Forward-Secrecy Symmetric Ratchet for VeilX v5.2.0.
+ * src/crypto.js — VeilX 1.0.0 cryptographic primitives.
+ *
+ *   • FIPS 202 Keccak (SHA3-256/512, SHAKE128/256), pure JS
+ *   • FIPS 203 ML-KEM-768 (KeyGen / Encaps / Decaps), pure JS — cross-checked
+ *     against an independent audited implementation (see tests/kat.json)
+ *   • WebCrypto wrappers: HKDF-SHA256, HMAC-SHA256, ECDH P-256, AES-256-GCM, PBKDF2
+ *   • Passphrase handling and the encrypted-at-rest Vault envelope
+ *
+ * Protocol logic (handshake, ratchet, wire format) lives in src/protocol.js.
+ *
+ * NOTE: this is a JavaScript implementation. It is functionally correct, but it
+ * is NOT guaranteed constant-time (JS engines give no such guarantee) and it
+ * has not been through FIPS 140/CAVP validation.
  */
 
-globalThis.GPV = globalThis.GPV || {};
+globalThis.VX = globalThis.VX || {};
 
-GPV.crypto = (() => {
+VX.crypto = (() => {
   "use strict";
 
   const webCrypto =
@@ -22,42 +33,40 @@ GPV.crypto = (() => {
         })()
       : null);
 
-  // ── Message format prefixes ──────────────────────────────────────────────
-  const MSG_PREFIX = "GPV2:";   // encrypted chat message
-  const KEY_PREFIX = "GPV2K:";  // public key / ML-KEM-768 handshake packet
+  const enc = new TextEncoder();
 
-  // ── Cryptographic constants ──────────────────────────────────────────────
+  // ── Constants ────────────────────────────────────────────────────────────
   const PBKDF2_ITERATIONS = 600000;
-  const PBKDF2_SALT = new TextEncoder().encode("guptavarta-v2-passphrase-salt");
-  const HKDF_INFO = new TextEncoder().encode("guptavarta-v2-conversation-key");
-  const PQ_HKDF_INFO = new TextEncoder().encode("veilx-v5-hybrid-p256-mlkem768-key");
-  const VAULT_SALT_PREFIX = "veilx-v5-vault-salt:";
+  const PASSPHRASE_SALT = enc.encode("veilx-v1-passphrase-salt");
+  const VAULT_SALT_PREFIX = "veilx-v1-vault-salt:";
+  const VAULT_AAD = enc.encode("veilx-v1-vault");
 
   const IV_BYTES = 12;
   const TAG_BYTES = 16;
   const PASSPHRASE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-  // ── NIST FIPS 203 ML-KEM-768 Constants ───────────────────────────────────
+  // ML-KEM-768 (FIPS 203)
   const MLKEM_Q = 3329;
   const MLKEM_N = 256;
-  const MLKEM_K = 3; // ML-KEM-768 (NIST Security Category 3)
-  const CLASSICAL_PUB_BYTES = 65;
-  const MLKEM_EK_BYTES = 1184; // 384 * 3 + 32
-  const MLKEM_DK_BYTES = 2400; // 1152 + 1184 + 32 + 32
-  const MLKEM_CT_BYTES = 1088; // 960 + 128
-  const HYBRID_PUB_BYTES = CLASSICAL_PUB_BYTES + MLKEM_EK_BYTES; // 1249 bytes
-  // Also keep legacy 337-byte / 401-byte bundle support so existing tests or v3/v4 keys parse cleanly
-  const LEGACY_HYBRID_BYTES_V4 = 337;
-  const LEGACY_HYBRID_BYTES_V3 = 401;
+  const MLKEM_K = 3;
+  const MLKEM_EK_BYTES = 1184;
+  const MLKEM_DK_BYTES = 2400;
+  const MLKEM_CT_BYTES = 1088;
+  const P256_PUB_BYTES = 65;
 
   // ── Base64 & Byte Helpers ────────────────────────────────────────────────
 
   function bytesToBase64(bytes) {
-    let binary = "";
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    const CHUNK = 0x8000;
+    if (u8.length <= CHUNK) {
+      return btoa(String.fromCharCode.apply(null, u8));
     }
-    return btoa(binary);
+    const parts = [];
+    for (let i = 0; i < u8.length; i += CHUNK) {
+      parts.push(String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK)));
+    }
+    return btoa(parts.join(""));
   }
 
   function base64ToBytes(b64) {
@@ -96,10 +105,6 @@ GPV.crypto = (() => {
     }
   }
 
-  function sortPair(a, b) {
-    return a <= b ? [a, b] : [b, a];
-  }
-
   // ── Fast 32-bit Interleaved FIPS 202 Keccak-f[1600] (SHA-3 & SHAKE) ──────
 
   const RC_HI = new Uint32Array([
@@ -123,9 +128,12 @@ GPV.crypto = (() => {
     22, 9, 6, 1,
   ];
 
+  const K_BLO = new Uint32Array(5);
+  const K_BHI = new Uint32Array(5);
+
   function keccakF1600(sLo, sHi) {
-    const bLo = new Uint32Array(5);
-    const bHi = new Uint32Array(5);
+    const bLo = K_BLO;
+    const bHi = K_BHI;
     for (let round = 0; round < 24; round++) {
       for (let i = 0; i < 5; i++) {
         bLo[i] = sLo[i] ^ sLo[i + 5] ^ sLo[i + 10] ^ sLo[i + 15] ^ sLo[i + 20];
@@ -377,23 +385,32 @@ GPV.crypto = (() => {
       bitBuf >>>= d;
       bitCount -= d;
     }
+    // FIPS 203 Algorithm 6: for d = 12 the decoded value is reduced mod q.
+    // (This is what makes the encapsulation-key modulus check effective.)
+    if (d === 12) {
+      for (let i = 0; i < 256; i++) f[i] = f[i] % MLKEM_Q;
+    }
     return f;
   }
 
+  // Compress / Decompress use integer multiply-shift arithmetic only (no
+  // floating-point division of secret-derived values — the "KyberSlash" class).
+  // compress(x, d) = floor((x * 2^d + 1664) / q) mod 2^d, with 330282857 = ceil(2^40 / q) (exact for every 0 <= x < q, d <= 10; products stay below 2^53).
   function mlkemCompress(f, d) {
     const r = new Int32Array(256);
-    const twoD = 1 << d;
+    const mask = (1 << d) - 1;
     for (let i = 0; i < 256; i++) {
-      r[i] = Math.round((twoD * f[i]) / MLKEM_Q) % twoD;
+      const num = f[i] * (1 << d) + 1664;
+      r[i] = Math.floor((num * 330282857) / 1099511627776) & mask;
     }
     return r;
   }
 
   function mlkemDecompress(f, d) {
     const r = new Int32Array(256);
-    const twoD = 1 << d;
+    const half = 1 << (d - 1);
     for (let i = 0; i < 256; i++) {
-      r[i] = Math.round((MLKEM_Q * f[i]) / twoD) % MLKEM_Q;
+      r[i] = (MLKEM_Q * f[i] + half) >> d;
     }
     return r;
   }
@@ -523,18 +540,14 @@ GPV.crypto = (() => {
   }
 
   /**
-   * NIST FIPS 203 ML-KEM-768 Encapsulation (`ML-KEM.Encaps`).
-   * Takes a peer's Hybrid Public Key (`peerPublicB64`, 1249 bytes) and returns
-   * `{ ciphertextB64 (1088 bytes encoded), sharedSecret (32 bytes) }`.
+   * ML-KEM.Encaps_internal (FIPS 203 Alg. 17) with caller-supplied message `m`.
+   * Exposed for known-answer tests; production code uses `mlkem768Encaps`.
    */
-  async function pqEncapsulate(peerPublicB64) {
-    const raw = base64ToBytes(peerPublicB64);
-    if (raw.length !== HYBRID_PUB_BYTES) {
-      throw new Error("Peer public key does not contain a NIST FIPS 203 ML-KEM-768 key");
+  function mlkem768EncapsInternal(ek, m) {
+    if (!(ek instanceof Uint8Array) || ek.length !== MLKEM_EK_BYTES) {
+      throw new Error("Invalid ML-KEM-768 encapsulation key length");
     }
-    const ek = raw.subarray(CLASSICAL_PUB_BYTES, HYBRID_PUB_BYTES);
-
-    // FIPS 203 modulus check on ek: verify ByteEncode_12(ByteDecode_12(tHat)) == ek[0..1152]
+    // FIPS 203 §7.2 modulus check: ByteEncode12(ByteDecode12(ek)) must equal ek.
     for (let i = 0; i < MLKEM_K; i++) {
       const slice = ek.subarray(384 * i, 384 * (i + 1));
       const reEncoded = mlkemByteEncode(mlkemByteDecode(slice, 12), 12);
@@ -542,52 +555,60 @@ GPV.crypto = (() => {
         throw new Error("Invalid ML-KEM-768 encapsulation key (failed FIPS 203 modulus check)");
       }
     }
-
-    const m = webCrypto.getRandomValues(new Uint8Array(32));
     const hEk = sha3_256(ek);
     const kr = sha3_512(concatBytes(m, hEk));
     const sharedSecret = new Uint8Array(kr.subarray(0, 32));
-    const r = kr.subarray(32, 64);
-    const c = mlkem768PkeEncrypt(ek, m, r);
-    zeroize(m);
+    const c = mlkem768PkeEncrypt(ek, m, kr.subarray(32, 64));
+    return { ct: c, ss: sharedSecret };
+  }
 
-    return {
-      ciphertextB64: bytesToBase64(c),
-      sharedSecret,
-    };
+  /** ML-KEM.Encaps — returns `{ ct (1088 B), ss (32 B) }`. */
+  function mlkem768Encaps(ek) {
+    const m = webCrypto.getRandomValues(new Uint8Array(32));
+    try {
+      return mlkem768EncapsInternal(ek, m);
+    } finally {
+      zeroize(m);
+    }
   }
 
   /**
-   * NIST FIPS 203 ML-KEM-768 Decapsulation (`ML-KEM.Decaps`) with Fujisaki-Okamoto
-   * implicit rejection.
+   * ML-KEM.Decaps with FIPS 203 §7.3 decapsulation-key check and
+   * implicit rejection. The accept/reject selection is branch-free.
    */
-  async function pqDecapsulate(myPrivateJwk, ciphertextB64) {
-    if (!myPrivateJwk || !myPrivateJwk.mlkemDkB64) {
-      throw new Error("Missing NIST FIPS 203 ML-KEM-768 decapsulation key");
-    }
-    const dk = base64ToBytes(myPrivateJwk.mlkemDkB64);
-    const c = base64ToBytes(ciphertextB64);
-    if (dk.length !== MLKEM_DK_BYTES || c.length !== MLKEM_CT_BYTES) {
+  function mlkem768Decaps(dk, c) {
+    if (
+      !(dk instanceof Uint8Array) || dk.length !== MLKEM_DK_BYTES ||
+      !(c instanceof Uint8Array) || c.length !== MLKEM_CT_BYTES
+    ) {
       throw new Error("Invalid ML-KEM-768 key or ciphertext length");
     }
-
     const dkPke = dk.subarray(0, 1152);
     const ekPke = dk.subarray(1152, 2336);
     const h = dk.subarray(2336, 2368);
     const z = dk.subarray(2368, 2400);
+    if (!timingSafeEqualBytes(sha3_256(ekPke), h)) {
+      throw new Error("Invalid ML-KEM-768 decapsulation key (hash check failed)");
+    }
 
     const mPrime = mlkem768PkeDecrypt(dkPke, c);
     const krPrime = sha3_512(concatBytes(mPrime, h));
-    const kPrime = new Uint8Array(krPrime.subarray(0, 32));
-    const rPrime = krPrime.subarray(32, 64);
+    const kPrime = krPrime.subarray(0, 32);
     const kBar = shake256(concatBytes(z, c), 32);
-    const cPrime = mlkem768PkeEncrypt(ekPke, mPrime, rPrime);
+    const cPrime = mlkem768PkeEncrypt(ekPke, mPrime, krPrime.subarray(32, 64));
 
-    const valid = timingSafeEqualBytes(c, cPrime);
-    return valid ? kPrime : kBar;
+    let diff = 0;
+    for (let i = 0; i < c.length; i++) diff |= c[i] ^ cPrime[i];
+    const mask = ((diff | -diff) >>> 31) - 1; // all-ones iff diff === 0
+    const out = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) {
+      out[i] = (kPrime[i] & mask) | (kBar[i] & ~mask);
+    }
+    zeroize(mPrime);
+    return out;
   }
 
-  // ── Traffic-Analysis Padding (ISO/IEC 7816-4 Block Padding) ──────────────
+  // ── Padding (ISO/IEC 7816-4) ─────────────────────────────────────────────
 
   function padBytes(plainBytes, blockSize = 32) {
     const rem = (plainBytes.length + 1) % blockSize;
@@ -598,553 +619,153 @@ GPV.crypto = (() => {
     return out;
   }
 
+  /** Strict unpad: returns null if the padding is malformed. */
   function unpadBytes(paddedBytes) {
     for (let i = paddedBytes.length - 1; i >= 0; i--) {
-      if (paddedBytes[i] === 0x80) {
-        return paddedBytes.subarray(0, i);
-      }
-      if (paddedBytes[i] !== 0x00) {
-        break;
-      }
+      if (paddedBytes[i] === 0x80) return paddedBytes.subarray(0, i);
+      if (paddedBytes[i] !== 0x00) return null;
     }
-    return paddedBytes;
+    return null;
   }
 
-  // ── True Destructive Forward-Secrecy Symmetric Chain Ratchet ─────────────
+  // ── WebCrypto wrappers ───────────────────────────────────────────────────
 
-  /**
-   * Advance a 32-byte Chain Key (`chainKeyBytes`) by one irreversible step using
-   * HMAC-SHA256 (one-way PRF):
-   *   `messageKeyBytes = HMAC-SHA256(chainKeyBytes, 0x01 || threadId || seq)`
-   *   `nextChainKeyBytes = HMAC-SHA256(chainKeyBytes, 0x02 || threadId || seq)`
-   *
-   * When the caller overwrites the stored `chainKeyB64` with `nextChainKeyBytes`
-   * and zeroizes the old `chainKeyBytes`, a future compromise of `nextChainKeyBytes`
-   * CANNOT recover `chainKeyBytes` or `messageKeyBytes` — providing true forward
-   * secrecy for all previously sent messages!
-   */
-  async function ratchetChainStep(chainKeyBytes, seq = 1, threadId = "") {
-    if (typeof chainKeyBytes === "string") {
-      chainKeyBytes = base64ToBytes(chainKeyBytes);
-    }
-    if (!(chainKeyBytes instanceof Uint8Array) || chainKeyBytes.length !== 32) {
-      throw new Error("Chain key must be exactly 32 bytes");
-    }
-    const hmacKey = await webCrypto.subtle.importKey(
-      "raw",
-      chainKeyBytes,
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["sign"]
-    );
-    const contextBytes = new TextEncoder().encode(`:${threadId}:${seq}`);
-    const msgInput = concatBytes(new Uint8Array([0x01]), contextBytes);
-    const nextInput = concatBytes(new Uint8Array([0x02]), contextBytes);
-
-    const messageKeyBytes = new Uint8Array(
-      await webCrypto.subtle.sign("HMAC", hmacKey, msgInput)
-    );
-    const nextChainKeyBytes = new Uint8Array(
-      await webCrypto.subtle.sign("HMAC", hmacKey, nextInput)
-    );
-    const messageAesKey = await importAesKey(messageKeyBytes);
-
-    return {
-      messageAesKey,
-      messageKeyBytes,
-      messageKeyB64: bytesToBase64(messageKeyBytes),
-      nextChainKeyBytes,
-      nextChainKeyB64: bytesToBase64(nextChainKeyBytes),
-    };
+  async function sha256(bytes) {
+    return new Uint8Array(await webCrypto.subtle.digest("SHA-256", bytes));
   }
 
-  /**
-   * Backward-compatible helper for deriving a subkey at `seq`.
-   */
-  async function deriveMessageSubkey(rootKeyBytes, seq = 0, threadId = "") {
-    const step = await ratchetChainStep(rootKeyBytes, seq, threadId);
-    return step.messageAesKey;
+  async function hmacSha256(keyBytes, dataBytes) {
+    const key = await webCrypto.subtle.importKey(
+      "raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+    );
+    return new Uint8Array(await webCrypto.subtle.sign("HMAC", key, dataBytes));
   }
 
-  // ── AES-256-GCM: Authenticated Message & Envelope Encryption ─────────────
+  async function hkdf(ikm, salt, info, length = 32) {
+    const base = await webCrypto.subtle.importKey("raw", ikm, { name: "HKDF" }, false, ["deriveBits"]);
+    const bits = await webCrypto.subtle.deriveBits(
+      { name: "HKDF", hash: "SHA-256", salt, info: typeof info === "string" ? enc.encode(info) : info },
+      base,
+      length * 8
+    );
+    return new Uint8Array(bits);
+  }
 
   async function importAesKey(rawKeyBytes) {
     if (!rawKeyBytes || rawKeyBytes.length !== 32) {
       throw new Error("AES-256 key must be exactly 32 bytes");
     }
-    return webCrypto.subtle.importKey(
-      "raw",
-      rawKeyBytes,
-      { name: "AES-GCM" },
-      false,
-      ["encrypt", "decrypt"]
-    );
+    return webCrypto.subtle.importKey("raw", rawKeyBytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
   }
 
-  async function encryptMessage(aesKey, plaintext, options = {}) {
-    if (typeof plaintext !== "string") {
-      throw new Error("Plaintext must be a string");
-    }
+  /** AES-256-GCM seal. Returns iv || ciphertext || tag. */
+  async function aesGcmSeal(keyBytes, plaintext, aad) {
+    const key = await importAesKey(keyBytes);
     const iv = webCrypto.getRandomValues(new Uint8Array(IV_BYTES));
-
-    let payloadBytes;
-    if (options && options.envelope) {
-      const envObj = {
-        t: plaintext,
-        seq: Number.isInteger(options.envelope.seq) ? options.envelope.seq : 1,
-        ts: options.envelope.ts || Date.now(),
-        id:
-          options.envelope.id ||
-          bytesToBase64(webCrypto.getRandomValues(new Uint8Array(8))),
-      };
-      if (options.envelope.fp) envObj.fp = options.envelope.fp;
-      if (options.envelope.gid) {
-        envObj.gid = options.envelope.gid;
-        envObj.ci = options.envelope.ci;
-        envObj.ct = options.envelope.ct;
-      }
-      const envBytes = new TextEncoder().encode(JSON.stringify(envObj));
-      if (options.pad) {
-        const padded = padBytes(envBytes, options.blockSize || 32);
-        payloadBytes = new Uint8Array(1 + padded.length);
-        payloadBytes[0] = 0x02;
-        payloadBytes.set(padded, 1);
-      } else {
-        payloadBytes = new Uint8Array(1 + envBytes.length);
-        payloadBytes[0] = 0x01;
-        payloadBytes.set(envBytes, 1);
-      }
-    } else {
-      const encoded = new TextEncoder().encode(plaintext);
-      if (options && options.pad) {
-        const padded = padBytes(encoded, options.blockSize || 32);
-        payloadBytes = new Uint8Array(1 + padded.length);
-        payloadBytes[0] = 0x00;
-        payloadBytes.set(padded, 1);
-      } else {
-        payloadBytes = encoded;
-      }
-    }
-
-    const algorithm = { name: "AES-GCM", iv };
-    if (options && options.aad) {
-      algorithm.additionalData =
-        typeof options.aad === "string"
-          ? new TextEncoder().encode(options.aad)
-          : options.aad;
-    }
-
-    const ciphertext = new Uint8Array(
-      await webCrypto.subtle.encrypt(algorithm, aesKey, payloadBytes)
+    const ct = new Uint8Array(
+      await webCrypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: aad }, key, plaintext)
     );
-    return MSG_PREFIX + bytesToBase64(concatBytes(iv, ciphertext));
+    return concatBytes(iv, ct);
   }
 
-  async function decryptMessage(aesKey, blob, options = {}) {
-    if (typeof blob !== "string" || !blob.startsWith(MSG_PREFIX)) {
-      throw new Error("Not a GPV2 message");
-    }
-    const rawB64 = blob.slice(MSG_PREFIX.length).replace(/[\u200B-\u200D\uFEFF\u00AD\s]+/g, "");
-    const bytes = base64ToBytes(rawB64);
-    if (bytes.length < IV_BYTES + TAG_BYTES) {
-      throw new Error("Message too short");
-    }
-    const iv = bytes.slice(0, IV_BYTES);
-    const ciphertext = bytes.slice(IV_BYTES);
-
-    const algorithm = { name: "AES-GCM", iv };
-    if (options && options.aad) {
-      algorithm.additionalData =
-        typeof options.aad === "string"
-          ? new TextEncoder().encode(options.aad)
-          : options.aad;
-    }
-
-    const plainBytes = new Uint8Array(
-      await webCrypto.subtle.decrypt(algorithm, aesKey, ciphertext)
+  async function aesGcmOpen(keyBytes, ivCt, aad) {
+    if (ivCt.length < IV_BYTES + TAG_BYTES) throw new Error("Message too short");
+    const key = await importAesKey(keyBytes);
+    return new Uint8Array(
+      await webCrypto.subtle.decrypt(
+        { name: "AES-GCM", iv: ivCt.subarray(0, IV_BYTES), additionalData: aad },
+        key,
+        ivCt.subarray(IV_BYTES)
+      )
     );
-
-    let text = "";
-    let envelope = null;
-
-    if (plainBytes.length >= 2 && (plainBytes[0] === 0x01 || plainBytes[0] === 0x02)) {
-      const body =
-        plainBytes[0] === 0x02
-          ? unpadBytes(plainBytes.subarray(1))
-          : plainBytes.subarray(1);
-      envelope = JSON.parse(new TextDecoder().decode(body));
-      text = typeof envelope.t === "string" ? envelope.t : "";
-    } else if (plainBytes.length >= 2 && plainBytes[0] === 0x00) {
-      const unpadded = unpadBytes(plainBytes.subarray(1));
-      text = new TextDecoder().decode(unpadded);
-    } else {
-      text = new TextDecoder().decode(plainBytes);
-    }
-
-    if (options && options.returnEnvelope) {
-      return {
-        text,
-        envelope,
-        ivB64: bytesToBase64(iv),
-      };
-    }
-    return text;
   }
 
-  // ── Method 1: Key from a Shared Passphrase ───────────────────────────────
+  // ── Ephemeral ECDH P-256 ─────────────────────────────────────────────────
 
-  async function deriveKeyFromPassphrase(passphrase, threadId = "") {
-    if (typeof passphrase !== "string" || !passphrase.trim()) {
-      throw new Error("Passphrase cannot be empty");
+  async function generateEcdhKeyPair() {
+    const pair = await webCrypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const pubRaw = new Uint8Array(await webCrypto.subtle.exportKey("raw", pair.publicKey));
+    const privJwk = await webCrypto.subtle.exportKey("jwk", pair.privateKey);
+    return { pubRaw, privJwk };
+  }
+
+  async function ecdhDerive(privJwk, peerPubRaw) {
+    if (!(peerPubRaw instanceof Uint8Array) || peerPubRaw.length !== P256_PUB_BYTES || peerPubRaw[0] !== 0x04) {
+      throw new Error("Invalid P-256 public key");
     }
-    const cleaned = passphrase.trim().normalize("NFKC");
-    const salt = threadId
-      ? new TextEncoder().encode(`veilx-v5-passphrase-salt:${threadId}`)
-      : PBKDF2_SALT;
-
-    const baseKey = await webCrypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(cleaned),
-      { name: "PBKDF2" },
+    const priv = await webCrypto.subtle.importKey(
+      "jwk",
+      { kty: privJwk.kty, crv: privJwk.crv, x: privJwk.x, y: privJwk.y, d: privJwk.d, ext: true },
+      { name: "ECDH", namedCurve: "P-256" },
       false,
       ["deriveBits"]
     );
+    // importKey validates that the point is on the curve.
+    const pub = await webCrypto.subtle.importKey(
+      "raw", peerPubRaw, { name: "ECDH", namedCurve: "P-256" }, false, []
+    );
+    return new Uint8Array(await webCrypto.subtle.deriveBits({ name: "ECDH", public: pub }, priv, 256));
+  }
+
+  // ── Passphrase mode ──────────────────────────────────────────────────────
+  // Only machine-generated 100-bit passphrases are accepted: a human-chosen
+  // phrase cannot be made safe against offline guessing of captured ciphertext.
+
+  function generatePassphrase() {
+    const out = [];
+    const random = webCrypto.getRandomValues(new Uint8Array(20));
+    for (let i = 0; i < random.length; i++) out.push(PASSPHRASE_ALPHABET[random[i] & 31]);
+    return [out.slice(0, 5), out.slice(5, 10), out.slice(10, 15), out.slice(15, 20)]
+      .map((g) => g.join(""))
+      .join("-");
+  }
+
+  /** Returns the canonical 20-character passphrase, or null if it is not a VeilX-generated one. */
+  function normalizePassphrase(input) {
+    if (typeof input !== "string") return null;
+    const cleaned = input.normalize("NFKC").toUpperCase().replace(/[\s-]+/g, "");
+    if (cleaned.length !== 20) return null;
+    for (const ch of cleaned) if (!PASSPHRASE_ALPHABET.includes(ch)) return null;
+    return cleaned;
+  }
+
+  async function deriveRootFromPassphrase(passphrase) {
+    const canonical = normalizePassphrase(passphrase);
+    if (!canonical) {
+      throw new Error("Use a passphrase generated by VeilX (20 characters, e.g. ABCDE-FGHJK-LMNPQ-RSTUV).");
+    }
+    const baseKey = await webCrypto.subtle.importKey("raw", enc.encode(canonical), { name: "PBKDF2" }, false, ["deriveBits"]);
     const bits = await webCrypto.subtle.deriveBits(
-      {
-        name: "PBKDF2",
-        salt,
-        iterations: PBKDF2_ITERATIONS,
-        hash: "SHA-256",
-      },
+      { name: "PBKDF2", salt: PASSPHRASE_SALT, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
       baseKey,
       256
     );
     return new Uint8Array(bits);
   }
 
-  function generatePassphrase() {
-    const random = webCrypto.getRandomValues(new Uint8Array(20));
-    let chars = "";
-    for (let i = 0; i < random.length; i++) {
-      chars += PASSPHRASE_ALPHABET[random[i] & 31];
-      if (i % 5 === 4 && i !== random.length - 1) chars += "-";
-    }
-    return chars;
-  }
+  // ── Vault encryption at rest ─────────────────────────────────────────────
 
-  // ── Method 2: Hybrid NIST FIPS 203 ML-KEM-768 + ECDH P-256 Identity ──────
-
-  /**
-   * Generate a standardized Hybrid Post-Quantum + Classical Identity:
-   *   - Classical ECDH NIST P-256 keypair (65-byte uncompressed public point)
-   *   - Post-Quantum NIST FIPS 203 ML-KEM-768 keypair (1184-byte `ek`, 2400-byte `dk`)
-   *   - Combined `publicKey`: 1,249 bytes (Base64-encoded).
-   */
-  async function generateIdentity() {
-    const pair = await webCrypto.subtle.generateKey(
-      { name: "ECDH", namedCurve: "P-256" },
-      true,
-      ["deriveBits"]
-    );
-    const classicalPubRaw = new Uint8Array(
-      await webCrypto.subtle.exportKey("raw", pair.publicKey)
-    );
-    const privateJwk = await webCrypto.subtle.exportKey("jwk", pair.privateKey);
-    const mlkem = mlkem768KeyGen();
-
-    const hybridPubRaw = concatBytes(classicalPubRaw, mlkem.ek);
-    privateJwk.mlkemDkB64 = bytesToBase64(mlkem.dk);
-    privateJwk.pqMode = "hybrid-p256-mlkem768-fips203";
-
-    return {
-      publicKey: bytesToBase64(hybridPubRaw),
-      classicalPublicKey: bytesToBase64(classicalPubRaw),
-      privateJwk,
-      quantumSafe: true,
-      algorithm: "ML-KEM-768 + P-256",
-    };
-  }
-
-  function parsePublicKeyBundle(publicKeyB64) {
-    const raw = base64ToBytes(publicKeyB64);
-    if (raw.length === CLASSICAL_PUB_BYTES && raw[0] === 0x04) {
-      return {
-        valid: true,
-        quantumSafe: false,
-        classicalBytes: raw,
-        pqBytes: null,
-        fullB64: publicKeyB64,
-      };
-    }
-    if (raw.length === HYBRID_PUB_BYTES && raw[0] === 0x04) {
-      return {
-        valid: true,
-        quantumSafe: true,
-        algorithm: "ML-KEM-768",
-        classicalBytes: raw.subarray(0, CLASSICAL_PUB_BYTES),
-        pqBytes: raw.subarray(CLASSICAL_PUB_BYTES),
-        fullB64: publicKeyB64,
-      };
-    }
-    throw new Error("Invalid public key bundle length or format");
-  }
-
-  /**
-   * Format a key-exchange wire message (`GPV2K:<pubB64>` or `GPV2K:<pubB64>.<kemCtB64>`).
-   * Also see `makeKeyPackets` for splitting across Instagram's 1,000-character DM limit!
-   */
-  function makeKeyMessage(publicKeyB64, kemCiphertextB64 = null) {
-    if (kemCiphertextB64) {
-      return `${KEY_PREFIX}${publicKeyB64}.${kemCiphertextB64}`;
-    }
-    return KEY_PREFIX + publicKeyB64;
-  }
-
-  /**
-   * Split a large `GPV2K:` key bundle (e.g. 1,668-char ML-KEM-768 public key + 1,452-char
-   * ML-KEM-768 ciphertext) into chunks of at most 880 characters so every packet fits
-   * inside Instagram's 1,000-character DM limit:
-   *   `GPV2K:P1/2#<bundleId>#<slice1>`
-   *   `GPV2K:P2/2#<bundleId>#<slice2>`
-   */
-  function makeKeyPackets(publicKeyB64, kemCiphertextB64 = null, maxChunkChars = 860) {
-    const payload = kemCiphertextB64
-      ? `${publicKeyB64}.${kemCiphertextB64}`
-      : publicKeyB64;
-    if (KEY_PREFIX.length + payload.length <= 980) {
-      return [KEY_PREFIX + payload];
-    }
-    // Deterministic 8-char bundle ID from SHA3-256 of the payload
-    const hashHex = Array.from(
-      sha3_256(new TextEncoder().encode(payload)).subarray(0, 4)
-    )
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-
-    const chunks = [];
-    for (let i = 0; i < payload.length; i += maxChunkChars) {
-      chunks.push(payload.slice(i, i + maxChunkChars));
-    }
-    return chunks.map(
-      (chunk, idx) => `${KEY_PREFIX}P${idx + 1}/${chunks.length}#${hashHex}#${chunk}`
-    );
-  }
-
-  /**
-   * Parse a single `GPV2K:...` message (or reassembled payload).
-   */
-  function parseKeyMessage(text) {
-    if (typeof text !== "string") return null;
-    const cleaned = text.replace(/[\u200B-\u200D\uFEFF\u00AD\s]+/g, "");
-    if (!cleaned.startsWith(KEY_PREFIX)) return null;
-    const body = cleaned.slice(KEY_PREFIX.length);
-
-    // Check if it is a multi-part packet header `P1/2#id#chunk`
-    const partMatch = body.match(/^P(\d+)\/(\d+)#([0-9a-fA-F]{8})#([A-Za-z0-9+/.=]+)$/);
-    if (partMatch) {
-      return {
-        isPartial: true,
-        partIndex: Number(partMatch[1]),
-        partTotal: Number(partMatch[2]),
-        bundleId: partMatch[3],
-        chunk: partMatch[4],
-      };
-    }
-
-    const match = body.match(/^([A-Za-z0-9+/]+=*)(?:\.([A-Za-z0-9+/]+=*))?/);
-    if (!match) return null;
-    try {
-      const pubB64 = match[1];
-      const kemCtB64 = match[2] || null;
-      const bundle = parsePublicKeyBundle(pubB64);
-      if (kemCtB64) {
-        const ctBytes = base64ToBytes(kemCtB64);
-        if (ctBytes.length !== MLKEM_CT_BYTES) return null;
-      }
-      return {
-        isPartial: false,
-        publicKeyB64: pubB64,
-        kemCiphertextB64: kemCtB64,
-        quantumSafe: bundle.quantumSafe,
-      };
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /**
-   * Reassemble a list of raw `GPV2K:...` strings from the conversation DOM into
-   * complete parsed key entries (`{ publicKeyB64, kemCiphertextB64, quantumSafe }`).
-   */
-  function reassembleKeyPackets(rawTexts) {
-    const completeEntries = [];
-    const partialMap = new Map(); // bundleId -> { total, parts: Map(idx -> chunk) }
-
-    for (const raw of rawTexts) {
-      const parsed = parseKeyMessage(raw);
-      if (!parsed) continue;
-      if (!parsed.isPartial) {
-        completeEntries.push(parsed);
-        continue;
-      }
-      let group = partialMap.get(parsed.bundleId);
-      if (!group) {
-        group = { total: parsed.partTotal, parts: new Map() };
-        partialMap.set(parsed.bundleId, group);
-      }
-      group.parts.set(parsed.partIndex, parsed.chunk);
-      if (group.parts.size === group.total) {
-        let joined = "";
-        let allPresent = true;
-        for (let i = 1; i <= group.total; i++) {
-          if (!group.parts.has(i)) {
-            allPresent = false;
-            break;
-          }
-          joined += group.parts.get(i);
-        }
-        if (allPresent) {
-          const full = parseKeyMessage(KEY_PREFIX + joined);
-          if (full && !full.isPartial) {
-            completeEntries.push(full);
-          }
-          partialMap.delete(parsed.bundleId);
-        }
-      }
-    }
-    return completeEntries;
-  }
-
-  /**
-   * Derive a 32-byte shared root/chain key from our private key, the peer's public key,
-   * and the mandatory 32-byte NIST FIPS 203 ML-KEM-768 `pqSharedSecret`.
-   */
-  async function deriveSharedKey(myPrivateJwk, myPublicB64, peerPublicB64, pqSharedSecret = null) {
-    const myBundle = parsePublicKeyBundle(myPublicB64);
-    const peerBundle = parsePublicKeyBundle(peerPublicB64);
-
-    const bothQuantumSafe = Boolean(myBundle.quantumSafe && peerBundle.quantumSafe);
-    if (bothQuantumSafe) {
-      if (typeof pqSharedSecret === "string") {
-        pqSharedSecret = base64ToBytes(pqSharedSecret);
-      }
-      if (!(pqSharedSecret instanceof Uint8Array) || pqSharedSecret.length !== 32) {
-        throw new Error(
-          "Post-quantum hybrid key derivation requires a 32-byte ML-KEM-768 shared secret"
-        );
-      }
-    }
-
-    const cleanJwk = {
-      kty: myPrivateJwk.kty,
-      crv: myPrivateJwk.crv,
-      x: myPrivateJwk.x,
-      y: myPrivateJwk.y,
-      d: myPrivateJwk.d,
-      ext: true,
-    };
-
-    const myPrivate = await webCrypto.subtle.importKey(
-      "jwk",
-      cleanJwk,
-      { name: "ECDH", namedCurve: "P-256" },
-      false,
-      ["deriveBits"]
-    );
-
-    const peerPublic = await webCrypto.subtle.importKey(
-      "raw",
-      peerBundle.classicalBytes,
-      { name: "ECDH", namedCurve: "P-256" },
-      false,
-      []
-    );
-
-    const ecdhBits = new Uint8Array(
-      await webCrypto.subtle.deriveBits(
-        { name: "ECDH", public: peerPublic },
-        myPrivate,
-        256
-      )
-    );
-
-    const [first, second] = sortPair(myPublicB64, peerPublicB64);
-    const salt = new TextEncoder().encode(first + "|" + second);
-
-    const ikm = bothQuantumSafe
-      ? concatBytes(ecdhBits, pqSharedSecret)
-      : ecdhBits;
-
-    const info = bothQuantumSafe ? PQ_HKDF_INFO : HKDF_INFO;
-
-    const hkdfBase = await webCrypto.subtle.importKey(
-      "raw",
-      ikm,
-      { name: "HKDF" },
-      false,
-      ["deriveBits"]
-    );
-    const bits = await webCrypto.subtle.deriveBits(
-      { name: "HKDF", hash: "SHA-256", salt, info },
-      hkdfBase,
+  async function vaultKey(passphrase, salt) {
+    const cleaned = passphrase.trim().normalize("NFKC");
+    const baseKey = await webCrypto.subtle.importKey("raw", enc.encode(cleaned), { name: "PBKDF2" }, false, ["deriveBits"]);
+    const keyBits = await webCrypto.subtle.deriveBits(
+      { name: "PBKDF2", salt: concatBytes(enc.encode(VAULT_SALT_PREFIX), salt), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+      baseKey,
       256
     );
-    zeroize(ecdhBits);
-    return new Uint8Array(bits);
+    return new Uint8Array(keyBits);
   }
-
-  /**
-   * Compute an 80-bit human-verifiable Safety Code ("A1B2 C3D4 E5F6 7788 99AA")
-   * over both full public key bundles (binding both P-256 and ML-KEM-768 keys).
-   */
-  async function safetyCode(publicKeyAB64, publicKeyBB64) {
-    const [first, second] = sortPair(publicKeyAB64, publicKeyBB64);
-    const digest = new Uint8Array(
-      await webCrypto.subtle.digest(
-        "SHA-256",
-        new TextEncoder().encode(first + "|" + second)
-      )
-    );
-    let hex = "";
-    for (let i = 0; i < 10; i++) {
-      hex += digest[i].toString(16).padStart(2, "0");
-    }
-    return hex.toUpperCase().match(/.{1,4}/g).join(" ");
-  }
-
-  // ── Vault Encryption at Rest ─────────────────────────────────────────────
 
   async function sealVaultData(passphrase, dataObj) {
     const salt = webCrypto.getRandomValues(new Uint8Array(16));
-    const cleaned = passphrase.trim().normalize("NFKC");
-    const baseKey = await webCrypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(cleaned),
-      { name: "PBKDF2" },
-      false,
-      ["deriveBits"]
-    );
-    const keyBits = await webCrypto.subtle.deriveBits(
-      {
-        name: "PBKDF2",
-        salt: concatBytes(new TextEncoder().encode(VAULT_SALT_PREFIX), salt),
-        iterations: PBKDF2_ITERATIONS,
-        hash: "SHA-256",
-      },
-      baseKey,
-      256
-    );
-    const aesKey = await importAesKey(new Uint8Array(keyBits));
-    const iv = webCrypto.getRandomValues(new Uint8Array(IV_BYTES));
-    const plaintextBytes = new TextEncoder().encode(JSON.stringify(dataObj));
-    const ct = new Uint8Array(
-      await webCrypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, plaintextBytes)
-    );
+    const key = await vaultKey(passphrase, salt);
+    const sealed = await aesGcmSeal(key, enc.encode(JSON.stringify(dataObj)), VAULT_AAD);
+    zeroize(key);
     return {
-      v: 5,
+      v: 1,
       saltB64: bytesToBase64(salt),
-      ivB64: bytesToBase64(iv),
-      ctB64: bytesToBase64(ct),
+      ivB64: bytesToBase64(sealed.subarray(0, IV_BYTES)),
+      ctB64: bytesToBase64(sealed.subarray(IV_BYTES)),
     };
   }
 
@@ -1152,50 +773,262 @@ GPV.crypto = (() => {
     if (!envelope || !envelope.saltB64 || !envelope.ivB64 || !envelope.ctB64) {
       throw new Error("Invalid vault envelope");
     }
-    const salt = base64ToBytes(envelope.saltB64);
-    const iv = base64ToBytes(envelope.ivB64);
-    const ct = base64ToBytes(envelope.ctB64);
-    const cleaned = passphrase.trim().normalize("NFKC");
-    const baseKey = await webCrypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(cleaned),
-      { name: "PBKDF2" },
-      false,
-      ["deriveBits"]
-    );
-    const keyBits = await webCrypto.subtle.deriveBits(
-      {
-        name: "PBKDF2",
-        salt: concatBytes(new TextEncoder().encode(VAULT_SALT_PREFIX), salt),
-        iterations: PBKDF2_ITERATIONS,
-        hash: "SHA-256",
-      },
-      baseKey,
-      256
-    );
-    const aesKey = await importAesKey(new Uint8Array(keyBits));
-    const plainBytes = await webCrypto.subtle.decrypt(
-      { name: "AES-GCM", iv },
-      aesKey,
-      ct
-    );
-    return JSON.parse(new TextDecoder().decode(plainBytes));
+    const key = await vaultKey(passphrase, base64ToBytes(envelope.saltB64));
+    try {
+      const plain = await aesGcmOpen(
+        key,
+        concatBytes(base64ToBytes(envelope.ivB64), base64ToBytes(envelope.ctB64)),
+        VAULT_AAD
+      );
+      return JSON.parse(new TextDecoder().decode(plain));
+    } finally {
+      zeroize(key);
+    }
+  }
+
+
+  // ── Sidecar Media Binary Encryption (VX1B) & Relay Request Binding ──────
+  // NOTE ON RELAY AUTHENTICATION:
+  //   A browser extension shipped to users cannot keep an embedded secret key confidential.
+  //   By default (`relaySecret` empty), `signRelayUpload` computes a public request-binding
+  //   MAC over `(timestamp, sha256Hex, powNonce)` so headers and body cannot be spliced in
+  //   transit, while abuse prevention on the public prototype relay is enforced server-side
+  //   via per-IP upload/download rate limits, per-IP byte quotas, and Proof-of-Work.
+  //   Operators running a private relay can set a non-empty `RELAY_SECRET` on the Worker and
+  //   in the VeilX popup to require keyed HMAC-SHA256 client authentication.
+  const MEDIA_MAGIC = new Uint8Array([0x56, 0x58, 0x31, 0x42, 0x01]); // "VX1B\x01"
+  const MAX_MEDIA_BYTES = 15 * 1024 * 1024; // 15 MB max media size
+  const RELAY_POW_BITS = 14;
+  const PUBLIC_RELAY_BINDING_TAG = "veilx-public-prototype-v1";
+
+  function bytesToHex(bytes) {
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  function hasLeadingZeroBits(bytes, bits) {
+    const fullBytes = bits >>> 3;
+    const remBits = bits & 7;
+    for (let i = 0; i < fullBytes; i++) {
+      if (bytes[i] !== 0) return false;
+    }
+    if (remBits > 0) {
+      const mask = (0xff << (8 - remBits)) & 0xff;
+      if ((bytes[fullBytes] & mask) !== 0) return false;
+    }
+    return true;
+  }
+
+  function computeRelayPow(timestampStr, sha256Hex, bits = RELAY_POW_BITS) {
+    const prefixBytes = enc.encode(`VX1-POW:${timestampStr}:${String(sha256Hex).toLowerCase()}:`);
+    const pLen = prefixBytes.length;
+    if (pLen + 12 >= 136) {
+      const prefix = `VX1-POW:${timestampStr}:${String(sha256Hex).toLowerCase()}:`;
+      for (let nonce = 0; nonce < 0x7fffffff; nonce++) {
+        if (hasLeadingZeroBits(sha3_256(enc.encode(prefix + nonce)), bits)) return String(nonce);
+      }
+      throw new Error("Could not compute relay Proof-of-Work.");
+    }
+    const block = new Uint8Array(136);
+    block.set(prefixBytes, 0);
+    const blockU32 = new Uint32Array(block.buffer);
+    const sLo = new Uint32Array(25);
+    const sHi = new Uint32Array(25);
+    const headBytes = new Uint8Array(8);
+    const headView = new DataView(headBytes.buffer);
+
+    for (let nonce = 0; nonce < 0x7fffffff; nonce++) {
+      const s = String(nonce);
+      const sLen = s.length;
+      for (let i = 0; i < sLen; i++) block[pLen + i] = s.charCodeAt(i);
+      const end = pLen + sLen;
+      for (let i = end; i < 136; i++) block[i] = 0;
+      block[end] ^= 0x06;
+      block[135] ^= 0x80;
+
+      for (let j = 0; j < 17; j++) {
+        sLo[j] = blockU32[j * 2];
+        sHi[j] = blockU32[j * 2 + 1];
+      }
+      for (let j = 17; j < 25; j++) {
+        sLo[j] = 0;
+        sHi[j] = 0;
+      }
+      keccakF1600(sLo, sHi);
+      headView.setUint32(0, sLo[0], true);
+      headView.setUint32(4, sHi[0], true);
+      if (hasLeadingZeroBits(headBytes, bits)) return s;
+    }
+    throw new Error("Could not compute relay Proof-of-Work.");
+  }
+
+  async function computeRelayPowAsync(timestampStr, sha256Hex, bits = RELAY_POW_BITS, onProgress) {
+    const prefixBytes = enc.encode(`VX1-POW:${timestampStr}:${String(sha256Hex).toLowerCase()}:`);
+    const pLen = prefixBytes.length;
+    if (pLen + 12 >= 136) {
+      return computeRelayPow(timestampStr, sha256Hex, bits);
+    }
+    const block = new Uint8Array(136);
+    block.set(prefixBytes, 0);
+    const blockU32 = new Uint32Array(block.buffer);
+    const sLo = new Uint32Array(25);
+    const sHi = new Uint32Array(25);
+    const headBytes = new Uint8Array(8);
+    const headView = new DataView(headBytes.buffer);
+
+    for (let nonce = 0; nonce < 0x7fffffff; nonce++) {
+      if ((nonce & 4095) === 4095) {
+        if (typeof onProgress === "function") onProgress(nonce + 1);
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      const s = String(nonce);
+      const sLen = s.length;
+      for (let i = 0; i < sLen; i++) block[pLen + i] = s.charCodeAt(i);
+      const end = pLen + sLen;
+      for (let i = end; i < 136; i++) block[i] = 0;
+      block[end] ^= 0x06;
+      block[135] ^= 0x80;
+
+      for (let j = 0; j < 17; j++) {
+        sLo[j] = blockU32[j * 2];
+        sHi[j] = blockU32[j * 2 + 1];
+      }
+      for (let j = 17; j < 25; j++) {
+        sLo[j] = 0;
+        sHi[j] = 0;
+      }
+      keccakF1600(sLo, sHi);
+      headView.setUint32(0, sLo[0], true);
+      headView.setUint32(4, sHi[0], true);
+      if (hasLeadingZeroBits(headBytes, bits)) return s;
+    }
+    throw new Error("Could not compute relay Proof-of-Work.");
+  }
+
+  function verifyRelayPow(timestampStr, sha256Hex, nonceStr, bits = RELAY_POW_BITS) {
+    if (typeof timestampStr !== "string" || typeof sha256Hex !== "string" || typeof nonceStr !== "string") {
+      return false;
+    }
+    if (!/^[0-9]{1,12}$/.test(nonceStr) || !/^[0-9a-f]{64}$/i.test(sha256Hex)) return false;
+    const digest = sha3_256(enc.encode(`VX1-POW:${timestampStr}:${sha256Hex.toLowerCase()}:${nonceStr}`));
+    return hasLeadingZeroBits(digest, bits);
+  }
+
+  async function signRelayUpload({ timestamp, sha256Hex, powNonce, relaySecret }) {
+    const keyMaterial = String(relaySecret || "").trim() || PUBLIC_RELAY_BINDING_TAG;
+    const keyBytes = sha3_256(enc.encode("veilx-relay-key:" + keyMaterial));
+    const msg = enc.encode(`VX1-AUTH:${timestamp}:${String(sha256Hex).toLowerCase()}:${powNonce}`);
+    const mac = await hmacSha256(keyBytes, msg);
+    zeroize(keyBytes);
+    return bytesToBase64(mac);
+  }
+
+  async function verifyRelayUpload({
+    timestamp,
+    sha256Hex,
+    powNonce,
+    signatureB64,
+    relaySecret,
+    nowMs = Date.now(),
+    maxSkewMs = 300000,
+    powBits = RELAY_POW_BITS,
+  }) {
+    const ts = Number(timestamp);
+    if (!Number.isFinite(ts) || Math.abs(nowMs - ts) > maxSkewMs) return false;
+    const cleanHex = String(sha256Hex || "").toLowerCase();
+    if (!verifyRelayPow(String(timestamp), cleanHex, String(powNonce || ""), powBits)) return false;
+    let sigBytes;
+    try {
+      sigBytes = base64ToBytes(String(signatureB64 || ""));
+    } catch (_) {
+      return false;
+    }
+    const expectedB64 = await signRelayUpload({
+      timestamp: String(timestamp),
+      sha256Hex: cleanHex,
+      powNonce: String(powNonce),
+      relaySecret,
+    });
+    return timingSafeEqualBytes(sigBytes, base64ToBytes(expectedB64));
+  }
+
+  /**
+   * Encrypts raw media bytes (images, short videos, or voice notes) with a fresh
+   * one-time 256-bit AES-GCM key and wraps the ciphertext in a `VX1B\x01` binary
+   * envelope bound to the MIME type via AAD. Original file bytes are preserved
+   * bit-for-bit without re-encoding.
+   */
+  async function sealMediaBinary(plainBytes, mimeType = "image/webp") {
+    const raw = plainBytes instanceof Uint8Array ? plainBytes : new Uint8Array(plainBytes || []);
+    if (raw.length === 0) throw new Error("Cannot encrypt empty media payload.");
+    if (raw.length > MAX_MEDIA_BYTES) {
+      throw new Error(`Media file exceeds maximum allowed size (${Math.round(MAX_MEDIA_BYTES / (1024 * 1024))} MB).`);
+    }
+    const cleanMime = String(mimeType || "application/octet-stream").trim().toLowerCase();
+    const mediaKey = webCrypto.getRandomValues(new Uint8Array(32));
+    const aad = enc.encode("VX1B-v1:" + cleanMime);
+    try {
+      const ivCt = await aesGcmSeal(mediaKey, raw, aad);
+      const envelopeBytes = concatBytes(MEDIA_MAGIC, ivCt);
+      const digest = await sha256(envelopeBytes);
+      return {
+        envelopeBytes,
+        keyB64: bytesToBase64(mediaKey),
+        sha256B64: bytesToBase64(digest),
+        sha256Hex: bytesToHex(digest),
+        mimeType: cleanMime,
+        size: raw.length,
+      };
+    } finally {
+      zeroize(mediaKey);
+    }
+  }
+
+  /**
+   * Verifies the `VX1B\x01` magic header and SHA-256 integrity hash in constant time
+   * before decrypting the media payload with the one-time 256-bit AES-GCM key.
+   */
+  async function openMediaBinary(envelopeBytes, keyB64, expectedSha256B64, mimeType = "image/webp") {
+    const env = envelopeBytes instanceof Uint8Array ? envelopeBytes : new Uint8Array(envelopeBytes || []);
+    if (env.length < MEDIA_MAGIC.length + IV_BYTES + TAG_BYTES + 1) {
+      throw new Error("Truncated or malformed VX1B media blob.");
+    }
+    if (!timingSafeEqualBytes(env.subarray(0, MEDIA_MAGIC.length), MEDIA_MAGIC)) {
+      throw new Error("Invalid media magic header (expected VX1B).");
+    }
+    const actualDigest = await sha256(env);
+    const expectedDigest = base64ToBytes(String(expectedSha256B64 || ""));
+    if (!timingSafeEqualBytes(actualDigest, expectedDigest)) {
+      throw new Error("Media ciphertext integrity check failed (SHA-256 mismatch).");
+    }
+    const cleanMime = String(mimeType || "application/octet-stream").trim().toLowerCase();
+    const keyBytes = base64ToBytes(String(keyB64 || ""));
+    try {
+      return await aesGcmOpen(keyBytes, env.subarray(MEDIA_MAGIC.length), enc.encode("VX1B-v1:" + cleanMime));
+    } finally {
+      zeroize(keyBytes);
+    }
   }
 
   return {
-    MSG_PREFIX,
-    KEY_PREFIX,
     PBKDF2_ITERATIONS,
-    CLASSICAL_PUB_BYTES,
+    MEDIA_MAGIC,
+    MAX_MEDIA_BYTES,
+    RELAY_POW_BITS,
+    PUBLIC_RELAY_BINDING_TAG,
+    IV_BYTES,
+    TAG_BYTES,
     MLKEM_EK_BYTES,
     MLKEM_DK_BYTES,
     MLKEM_CT_BYTES,
-    HYBRID_PUB_BYTES,
+    P256_PUB_BYTES,
     sha3_256,
     sha3_512,
     shake128,
     shake256,
     mlkem768KeyGen,
+    mlkem768Encaps,
+    mlkem768EncapsInternal,
+    mlkem768Decaps,
     bytesToBase64,
     base64ToBytes,
     concatBytes,
@@ -1203,26 +1036,29 @@ GPV.crypto = (() => {
     zeroize,
     padBytes,
     unpadBytes,
+    sha256,
+    hmacSha256,
+    hkdf,
     importAesKey,
-    ratchetChainStep,
-    deriveMessageSubkey,
-    encryptMessage,
-    decryptMessage,
-    deriveKeyFromPassphrase,
+    aesGcmSeal,
+    aesGcmOpen,
+    generateEcdhKeyPair,
+    ecdhDerive,
     generatePassphrase,
-    generateIdentity,
-    parsePublicKeyBundle,
-    makeKeyMessage,
-    makeKeyPackets,
-    parseKeyMessage,
-    reassembleKeyPackets,
-    deriveSharedKey,
-    pqEncapsulate,
-    pqDecapsulate,
-    safetyCode,
+    normalizePassphrase,
+    deriveRootFromPassphrase,
     sealVaultData,
     unsealVaultData,
+    bytesToHex,
+    computeRelayPow,
+    computeRelayPowAsync,
+    verifyRelayPow,
+    signRelayUpload,
+    verifyRelayUpload,
+    sealMediaBinary,
+    openMediaBinary,
+    randomBytes: (n) => webCrypto.getRandomValues(new Uint8Array(n)),
   };
 })();
 
-if (typeof module !== "undefined") module.exports = GPV.crypto;
+if (typeof module !== "undefined") module.exports = VX.crypto;

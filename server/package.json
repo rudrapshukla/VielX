@@ -1,0 +1,11 @@
+{
+  "name": "veilx-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VeilX Zero-Knowledge Encrypted Media Relay (Cloudflare Worker + R2)",
+  "main": "worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy worker.js --config wrangler.toml",
+    "start": "node local-relay.js"
+  }
+}
